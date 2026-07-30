@@ -169,7 +169,8 @@ ysu-net-watch watch --help
 
 ## 日志与隐私
 
-日志默认写入当前目录的 `ysu-net-watch.log`，并在达到大小限制后轮换。
+日志默认写入 `%LOCALAPPDATA%\YSUNetWatch\logs\ysu-net-watch.log`，并在达到大小限制后轮换。
+也可以使用 `watch --log-file` 指定其他位置。
 日志会过滤：
 
 - 密码及完整用户名。

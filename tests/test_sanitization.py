@@ -11,7 +11,8 @@ class SanitizationTests(unittest.TestCase):
     def test_terminal_ip_and_mac_are_redacted(self) -> None:
         value = (
             "终端IP(10.53.29.172)，终端MAC（84:9e:56:77:1e:49） "
-            "userIp=192.168.1.8 mac=849e56771e49"
+            "userIp=192.168.1.8 mac=849e56771e49 "
+            "contact student@example.edu.cn or 13800138000"
         )
 
         clean = sanitize_text(value)
@@ -20,6 +21,8 @@ class SanitizationTests(unittest.TestCase):
         self.assertNotIn("192.168.1.8", clean)
         self.assertNotIn("849e56771e49", clean)
         self.assertNotIn("84:9e:56:77:1e:49", clean)
+        self.assertNotIn("student@example.edu.cn", clean)
+        self.assertNotIn("13800138000", clean)
 
     def test_secret_and_sensitive_fields_are_redacted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

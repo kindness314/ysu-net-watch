@@ -9,14 +9,17 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
+# PyCryptodome deliberately provides the ``Crypto`` namespace. These imports
+# are not the abandoned PyCrypto package that Bandit's B413 check targets.
+from Crypto.Cipher import AES  # nosec B413
+from Crypto.Util.Padding import pad  # nosec B413
 
 
 AUTH_HOST = "auth1.ysu.edu.cn"
 BASE_URL = f"https://{AUTH_HOST}"
 CAS_REDIRECT_HOSTS = {AUTH_HOST, "cer.ysu.edu.cn"}
 PORTAL_REDIRECT_HOSTS = {*CAS_REDIRECT_HOSTS, "124.124.124.124"}
+PORTAL_HTTP_HOSTS = {"124.124.124.124"}
 
 
 class PortalError(RuntimeError):
@@ -57,6 +60,9 @@ class PortalClient:
 
     def _request(self, method: str, url: str, stage: str, **kwargs) -> requests.Response:
         kwargs.setdefault("timeout", self.timeout)
+        # Redirects are opt-in so request bodies containing session identifiers
+        # can never be forwarded before the destination has been validated.
+        kwargs.setdefault("allow_redirects", False)
         try:
             response = self.session.request(method, url, **kwargs)
             response.raise_for_status()
@@ -74,16 +80,48 @@ class PortalClient:
         stage: str,
         *,
         allowed_hosts: set[str] | None = None,
+        allowed_http_hosts: set[str] | None = None,
         **kwargs,
     ) -> requests.Response:
         """Follow redirects only after validating every destination host."""
         allowed_hosts = allowed_hosts or CAS_REDIRECT_HOSTS
+        allowed_http_hosts = allowed_http_hosts or set()
         current_method = method.upper()
         current_url = url
         current_kwargs = dict(kwargs)
         current_kwargs["allow_redirects"] = False
 
         for _ in range(10):
+            parsed_current = urlparse(current_url)
+            try:
+                port = parsed_current.port
+            except ValueError as exc:
+                raise PortalError(
+                    "unsafe_redirect", stage, f"{stage} returned an invalid redirect port"
+                ) from exc
+            hostname = (parsed_current.hostname or "").lower()
+            scheme = parsed_current.scheme.lower()
+            permitted_scheme = scheme == "https" or (
+                scheme == "http" and hostname in allowed_http_hosts
+            )
+            permitted_port = port is None or (
+                scheme == "https" and port == 443
+            ) or (
+                scheme == "http" and port == 80
+            )
+            if (
+                hostname not in allowed_hosts
+                or not permitted_scheme
+                or not permitted_port
+                or parsed_current.username is not None
+                or parsed_current.password is not None
+            ):
+                raise PortalError(
+                    "unsafe_redirect",
+                    stage,
+                    f"{stage} attempted to use an unsafe destination",
+                )
+
             response = self._request(
                 current_method, current_url, stage, **current_kwargs
             )
@@ -96,14 +134,6 @@ class PortalClient:
                     "protocol_changed", stage, f"{stage} redirect had no Location"
                 )
             target = urljoin(response.url, location)
-            hostname = (urlparse(target).hostname or "").lower()
-            if hostname not in allowed_hosts:
-                raise PortalError(
-                    "unsafe_redirect",
-                    stage,
-                    f"{stage} attempted to redirect to unexpected host {hostname!r}",
-                )
-
             if response.status_code == 303 or (
                 response.status_code in {301, 302} and current_method == "POST"
             ):
@@ -137,7 +167,7 @@ class PortalClient:
             f"{BASE_URL}/eportal/adaptor/getOnlineUserInfo"
             f"?sessionId={session_id}&{timestamp}&version=ysu-net-watch-0.2.0"
         )
-        response = self._request("GET", url, "status")
+        response = self._request_follow_safe("GET", url, "status")
         data = self._data_response(response, "status")
         if not isinstance(data, dict):
             raise PortalError("protocol_changed", "status", "status response has no data object")
@@ -156,6 +186,7 @@ class PortalClient:
             f"{BASE_URL}/eportal/redirect.jsp?mode=history",
             "portal_redirect",
             allowed_hosts=PORTAL_REDIRECT_HOSTS,
+            allowed_http_hosts=PORTAL_HTTP_HOSTS,
         )
 
         for _ in range(2):
@@ -174,6 +205,7 @@ class PortalClient:
                 target,
                 "portal_redirect",
                 allowed_hosts=PORTAL_REDIRECT_HOSTS,
+                allowed_http_hosts=PORTAL_HTTP_HOSTS,
             )
 
         parsed = urlparse(response.url)
@@ -210,7 +242,7 @@ class PortalClient:
             "ssid": session_info.get("ssid", ""),
         }
         login_url = f"{BASE_URL}/cas-sso/login?{urlencode(params)}"
-        response = self._request("GET", login_url, "cas_page")
+        response = self._request_follow_safe("GET", login_url, "cas_page")
         soup = BeautifulSoup(response.text, "html.parser")
         key_element = soup.select_one("p#login-croypto")
         execution_element = soup.select_one("p#login-page-flowkey")
@@ -249,7 +281,9 @@ class PortalClient:
 
     def _post_data(self, path: str, stage: str, session_id: str, **values) -> Any:
         payload = {"sessionId": session_id, **values}
-        response = self._request("POST", f"{BASE_URL}{path}", stage, json=payload)
+        response = self._request_follow_safe(
+            "POST", f"{BASE_URL}{path}", stage, json=payload
+        )
         return self._data_response(response, stage)
 
     def service_selection(self, session_id: str) -> Any:
@@ -258,7 +292,7 @@ class PortalClient:
         )
 
     def service_login(self, session_id: str, service: str) -> dict[str, Any]:
-        response = self._request(
+        response = self._request_follow_safe(
             "POST",
             f"{BASE_URL}/eportal/network/serviceLogin",
             "service_login",
@@ -304,7 +338,7 @@ class PortalClient:
     def kick_online_devices(
         self, session_id: str, online_user_uuids: list[str]
     ) -> None:
-        response = self._request(
+        response = self._request_follow_safe(
             "POST",
             f"{BASE_URL}/eportal/adaptor/kick-offline/batch",
             "kick_online_devices",

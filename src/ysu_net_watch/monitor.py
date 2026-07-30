@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -36,18 +37,34 @@ def sanitize_text(value: str, secrets: tuple[str, ...] = ()) -> str:
         clean,
     )
     clean = re.sub(
-        r"(?i)(终端IP|clientIp|userIp)\s*[（(:：=]\s*"
-        r"(?:\d{1,3}\.){3}\d{1,3}\)?",
-        r"\1=<REDACTED>",
+        r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])",
+        "<REDACTED-IP>",
         clean,
     )
     clean = re.sub(
-        r"(?i)(终端MAC|clientMac|userMac|mac)\s*[（(:：=]\s*"
-        r"(?:[0-9a-f]{2}[:-]?){5}[0-9a-f]{2}\)?",
-        r"\1=<REDACTED>",
+        r"(?i)(?<![0-9a-f])(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}(?![0-9a-f])"
+        r"|(?<![0-9a-f])[0-9a-f]{12}(?![0-9a-f])",
+        "<REDACTED-MAC>",
+        clean,
+    )
+    clean = re.sub(
+        r"(?i)(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w.-])",
+        "<REDACTED-EMAIL>",
+        clean,
+    )
+    clean = re.sub(
+        r"(?<!\d)1[3-9]\d{9}(?!\d)",
+        "<REDACTED-PHONE>",
         clean,
     )
     return clean[:500]
+
+
+def default_log_path() -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "YSUNetWatch" / "logs" / "ysu-net-watch.log"
+    return Path.home() / ".ysu-net-watch" / "logs" / "ysu-net-watch.log"
 
 
 @dataclass(frozen=True)

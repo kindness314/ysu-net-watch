@@ -22,6 +22,7 @@ from .monitor import (
     JsonEventLog,
     WatchSettings,
     Watcher,
+    default_log_path,
     sanitize_text,
 )
 from .portal import PortalClient, PortalError
@@ -135,7 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--confirmation-delay", type=float, default=120.0)
     watch.add_argument("--ping-host", default="baidu.com")
     watch.add_argument("--probe", action="append", default=[])
-    watch.add_argument("--log-file", type=Path, default=Path("ysu-net-watch.log"))
+    watch.add_argument("--log-file", type=Path, default=default_log_path())
     watch.add_argument("--once", action="store_true", help="只执行一轮检测")
 
     login = subparsers.add_parser("login", help="立即执行一次认证")
@@ -380,7 +381,9 @@ def run_console(*, enable_scheduler: bool = True) -> int:
 
             if current_worker is not None and current_worker.is_alive():
                 update_status("正在停止当前监听……")
-                assert current_stop is not None
+                if current_stop is None:
+                    update_status("监听线程状态异常；未启动新的监听。")
+                    return False
                 current_stop.set()
                 # Never wait for the worker while holding operation_lock:
                 # its final reporter update also needs that lock.
@@ -496,7 +499,7 @@ def run_console(*, enable_scheduler: bool = True) -> int:
                         conflict.phase,
                         now.date(),
                     )
-                    JsonEventLog(Path("ysu-net-watch.log")).write(
+                    JsonEventLog(default_log_path()).write(
                         "timer_conflict_skipped",
                         timer=conflict.index + 1,
                         phase=conflict.phase,
@@ -537,7 +540,7 @@ def run_console(*, enable_scheduler: bool = True) -> int:
                     update_status(
                         f"{timer_name} {phase_name}已跳过：{skip_reason}"
                     )
-                    JsonEventLog(Path("ysu-net-watch.log")).write(
+                    JsonEventLog(default_log_path()).write(
                         "schedule_skipped",
                         timer=selected.index + 1,
                         phase=selected.phase,

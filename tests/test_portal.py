@@ -8,6 +8,7 @@ import requests
 
 from ysu_net_watch.portal import (
     BASE_URL,
+    PORTAL_HTTP_HOSTS,
     PORTAL_REDIRECT_HOSTS,
     PortalClient,
     PortalError,
@@ -78,10 +79,43 @@ class PortalClientTests(unittest.TestCase):
             redirect.url,
             "portal_redirect",
             allowed_hosts=PORTAL_REDIRECT_HOSTS,
+            allowed_http_hosts=PORTAL_HTTP_HOSTS,
         )
 
         self.assertEqual(response.url, final.url)
         self.assertEqual(client._request.call_count, 2)
+
+    def test_safe_redirect_rejects_https_downgrade_for_auth_host(self) -> None:
+        client = PortalClient()
+        response = requests.Response()
+        response.status_code = 307
+        response.url = "https://auth1.ysu.edu.cn/api"
+        response.headers["Location"] = "http://auth1.ysu.edu.cn/capture"
+        client._request = Mock(return_value=response)
+
+        with self.assertRaises(PortalError) as raised:
+            client._request_follow_safe(
+                "POST",
+                response.url,
+                "test",
+                json={"sessionId": "secret-session"},
+            )
+
+        self.assertEqual(raised.exception.category, "unsafe_redirect")
+        self.assertEqual(client._request.call_count, 1)
+
+    def test_safe_redirect_rejects_nonstandard_port(self) -> None:
+        client = PortalClient()
+
+        with self.assertRaises(PortalError) as raised:
+            client._request_follow_safe(
+                "POST",
+                "https://auth1.ysu.edu.cn:4443/api",
+                "test",
+                json={"sessionId": "secret-session"},
+            )
+
+        self.assertEqual(raised.exception.category, "unsafe_redirect")
 
     def test_logout_uses_online_session_and_verifies_offline(self) -> None:
         client = PortalClient()
@@ -229,13 +263,13 @@ class PortalClientTests(unittest.TestCase):
         client = PortalClient()
         response = Mock()
         response.json.return_value = {"code": 200, "message": "ok"}
-        client._request = Mock(return_value=response)
+        client._request_follow_safe = Mock(return_value=response)
 
         client.kick_online_devices(
             "test-session", ["old-device-1", "old-device-2"]
         )
 
-        client._request.assert_called_once_with(
+        client._request_follow_safe.assert_called_once_with(
             "POST",
             f"{BASE_URL}/eportal/adaptor/kick-offline/batch",
             "kick_online_devices",
