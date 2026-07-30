@@ -1,0 +1,11 @@
+.venv/
+.tmp/
+__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+dist/
+release/
+build/
+*.egg-info/
+PLAN.md

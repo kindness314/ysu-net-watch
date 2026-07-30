@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ysu-net-watch"
+version = "0.2.0"
+description = "YSU iYanda captive portal watcher and automatic authenticator"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+authors = [
+  { name = "kindness314" },
+]
+keywords = ["YSU", "iYanDa", "captive-portal", "network-authentication"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: System :: Networking",
+]
+dependencies = [
+  "beautifulsoup4>=4.12,<5",
+  "pycryptodome>=3.20,<4",
+  "requests>=2.32,<3",
+]
+
+[project.scripts]
+ysu-net-watch = "ysu_net_watch.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/kindness314/ysu-net-watch"
+Repository = "https://github.com/kindness314/ysu-net-watch"
+Issues = "https://github.com/kindness314/ysu-net-watch/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ysu_net_watch"]
