@@ -32,6 +32,7 @@ class WifiConnectionState(str, Enum):
 class WifiConnectionInfo:
     state: WifiConnectionState
     ssid: str | None = None
+    reason: str | None = None
 
 
 class WifiConnector:
@@ -65,15 +66,39 @@ class WifiConnector:
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            raise WifiError("Windows Wi-Fi command could not be executed") from exc
+            raise WifiError(
+                f"Windows Wi-Fi command could not be executed: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _output_detail(result: subprocess.CompletedProcess[str]) -> str:
+        parts = []
+        for value in (result.stderr, result.stdout):
+            if value:
+                parts.append(str(value).strip())
+        return " ".join(" ".join(parts).split())[:240]
+
+    @classmethod
+    def _failure_message(
+        cls,
+        prefix: str,
+        result: subprocess.CompletedProcess[str],
+    ) -> str:
+        message = f"{prefix} (exit {result.returncode})"
+        detail = cls._output_detail(result)
+        return f"{message}: {detail}" if detail else message
 
     def connection_info(self) -> WifiConnectionInfo:
         if os.name != "nt":
             return WifiConnectionInfo(WifiConnectionState.UNKNOWN)
         result = self._run(["netsh", "wlan", "show", "interfaces"])
         if result.returncode != 0:
-            return WifiConnectionInfo(WifiConnectionState.UNKNOWN)
-        for line in result.stdout.splitlines():
+            return WifiConnectionInfo(
+                WifiConnectionState.UNKNOWN,
+                reason=self._failure_message("Wi-Fi status query failed", result),
+            )
+        output = result.stdout or ""
+        for line in output.splitlines():
             match = re.match(r"^\s*SSID\s*:\s*(.+?)\s*$", line)
             if match and not line.lstrip().startswith("BSSID"):
                 return WifiConnectionInfo(
@@ -83,9 +108,12 @@ class WifiConnector:
         # A successful query with at least one interface but no SSID means the
         # adapter is available and currently disconnected. If no interface can
         # be identified, fail closed instead of assuming switching is safe.
-        if re.search(r"(?im)^\s*(?:Name|名称)\s*:", result.stdout):
+        if re.search(r"(?im)^\s*(?:Name|名称)\s*:", output):
             return WifiConnectionInfo(WifiConnectionState.DISCONNECTED)
-        return WifiConnectionInfo(WifiConnectionState.UNKNOWN)
+        return WifiConnectionInfo(
+            WifiConnectionState.UNKNOWN,
+            reason="Windows did not report a wireless interface",
+        )
 
     def current_ssid(self) -> str | None:
         return self.connection_info().ssid
@@ -124,7 +152,9 @@ class WifiConnector:
             raise WifiError("Temporary Wi-Fi profile could not be created") from exc
         if added.returncode != 0:
             raise WifiError(
-                f"Windows could not add the open Wi-Fi profile (exit {added.returncode})"
+                self._failure_message(
+                    "Windows could not add the open Wi-Fi profile", added
+                )
             )
 
     def _repair_legacy_iyanda_profile(self) -> None:
@@ -142,12 +172,25 @@ class WifiConnector:
         )
         if deleted.returncode != 0:
             raise WifiError(
-                "Windows could not remove the obsolete iYanda Wi-Fi profile"
+                self._failure_message(
+                    "Windows could not remove the obsolete iYanda Wi-Fi profile",
+                    deleted,
+                )
             )
 
     def connect(self) -> WifiConnectResult:
         if os.name != "nt":
             raise WifiError("automatic Wi-Fi connection is supported only on Windows")
+
+        current = self.connection_info()
+        if (
+            current.state == WifiConnectionState.CONNECTED
+            and current.ssid is not None
+            and current.ssid.casefold() == self.ssid.casefold()
+        ):
+            if self.settle_delay:
+                self.sleeper(self.settle_delay)
+            return WifiConnectResult(self.ssid, profile_created=False)
 
         profile_created = False
         if self.create_open_profile:
@@ -173,7 +216,7 @@ class WifiConnector:
                 if not self.create_open_profile
                 else f"Windows could not enable automatic connection for {self.ssid!r}"
             )
-            raise WifiError(message)
+            raise WifiError(self._failure_message(message, auto))
 
         # Windows may need a moment to apply a newly added/updated profile.
         self.sleeper(1.0)
@@ -194,16 +237,21 @@ class WifiConnector:
                 self.sleeper(2.0)
         if connected is None or connected.returncode != 0:
             raise WifiError(
-                f"Windows could not connect to Wi-Fi {self.ssid!r} "
-                f"after 3 attempts (exit {connected.returncode if connected else 'unknown'})"
+                self._failure_message(
+                    f"Windows could not connect to Wi-Fi {self.ssid!r} "
+                    "after 3 attempts",
+                    connected,
+                )
             )
 
         # `netsh wlan connect` only confirms that Windows accepted the
         # connection request. Poll the interface until the requested SSID is
         # actually active before reporting success or allowing authentication.
         observed_ssid: str | None = None
+        last_info: WifiConnectionInfo | None = None
         for verification_attempt in range(10):
-            observed_ssid = self.current_ssid()
+            last_info = self.connection_info()
+            observed_ssid = last_info.ssid
             if (
                 observed_ssid is not None
                 and observed_ssid.casefold() == self.ssid.casefold()
@@ -212,11 +260,12 @@ class WifiConnector:
             if verification_attempt < 9:
                 self.sleeper(1.0)
         else:
-            detail = (
-                f"; current Wi-Fi is {observed_ssid!r}"
-                if observed_ssid
-                else "; no connected Wi-Fi was detected"
-            )
+            if last_info is not None and last_info.reason:
+                detail = f"; {last_info.reason}"
+            elif observed_ssid:
+                detail = f"; current Wi-Fi is {observed_ssid!r}"
+            else:
+                detail = "; no connected Wi-Fi was detected"
             raise WifiError(
                 f"Windows accepted the connection request for {self.ssid!r}, "
                 f"but the target SSID was not confirmed{detail}"

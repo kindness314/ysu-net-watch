@@ -77,6 +77,8 @@ def scheduled_wifi_skip_reason(connection: WifiConnectionInfo) -> str:
         return scheduled_skip_reason(connection.ssid)
     if connection.state == WifiConnectionState.DISCONNECTED:
         return ""
+    if connection.reason:
+        return f"无法确认无线网卡或 Wi-Fi 连接状态：{connection.reason}"
     return "无法确认无线网卡或 Wi-Fi 连接状态"
 
 
@@ -805,8 +807,12 @@ def run_console(*, enable_scheduler: bool = True) -> int:
                 1 for timer in defaults.timers if timer.enabled
             )
 
-            def short_line(value: str, limit: int = 30) -> str:
-                return value if len(value) <= limit else value[: limit - 1] + "…"
+            def short_line(value: str, limit: int = 72) -> str:
+                if len(value) <= limit:
+                    return value
+                head = max(24, (limit - 1) // 2)
+                tail = limit - head - 1
+                return value[:head] + "…" + value[-tail:]
 
             def menu_title() -> str:
                 with operation_lock:
