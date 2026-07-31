@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 from ysu_net_watch.wifi import (
     WifiConnectionState,
+    WifiConnectResult,
     WifiConnector,
     WifiError,
 )
@@ -91,7 +92,7 @@ class WifiConnectorTests(unittest.TestCase):
         self.assertEqual(info.state, WifiConnectionState.UNKNOWN)
     @patch("ysu_net_watch.wifi.os.name", "nt")
     def test_existing_profile_is_set_to_auto_and_connected(self) -> None:
-        runner = SequenceRunner(0, 0, ssid_result("iYanDa"))
+        runner = SequenceRunner(0, 0, 0, ssid_result("iYanDa"))
         sleeps: list[float] = []
         connector = WifiConnector(
             "iYanDa",
@@ -104,13 +105,30 @@ class WifiConnectorTests(unittest.TestCase):
         result = connector.connect()
 
         self.assertFalse(result.profile_created)
-        self.assertEqual(runner.commands[0][:4], ["netsh", "wlan", "set", "profileparameter"])
-        self.assertEqual(runner.commands[1][:3], ["netsh", "wlan", "connect"])
+        self.assertEqual(runner.commands[1][:4], ["netsh", "wlan", "set", "profileparameter"])
+        self.assertEqual(runner.commands[2][:3], ["netsh", "wlan", "connect"])
         self.assertEqual(sleeps, [1.0, 3])
 
     @patch("ysu_net_watch.wifi.os.name", "nt")
+    def test_already_connected_target_is_reused_without_reconnecting(self) -> None:
+        runner = SequenceRunner(ssid_result("iYanDa"))
+        sleeps: list[float] = []
+        connector = WifiConnector(
+            "iYanDa",
+            runner=runner,
+            sleeper=sleeps.append,
+            settle_delay=3,
+        )
+
+        result = connector.connect()
+
+        self.assertEqual(result, WifiConnectResult("iYanDa", False))
+        self.assertEqual(len(runner.commands), 1)
+        self.assertEqual(sleeps, [3])
+
+    @patch("ysu_net_watch.wifi.os.name", "nt")
     def test_missing_profile_creates_open_profile(self) -> None:
-        runner = SequenceRunner(1, 0, 0, 0, ssid_result("iYanDa"))
+        runner = SequenceRunner(1, 0, 0, 0, 0, ssid_result("iYanDa"))
         connector = WifiConnector(
             "iYanDa", runner=runner, sleeper=lambda _seconds: None
         )
@@ -118,13 +136,14 @@ class WifiConnectorTests(unittest.TestCase):
         result = connector.connect()
 
         self.assertTrue(result.profile_created)
-        add_command = runner.commands[1]
+        add_command = runner.commands[2]
         self.assertEqual(add_command[:4], ["netsh", "wlan", "add", "profile"])
         self.assertIn("user=current", add_command)
 
     @patch("ysu_net_watch.wifi.os.name", "nt")
     def test_incorrect_legacy_profile_is_removed_before_add(self) -> None:
         runner = SequenceRunner(
+            1,
             (0, 'SSID name : "iYanda"'),
             0,
             0,
@@ -139,15 +158,15 @@ class WifiConnectorTests(unittest.TestCase):
         connector.connect()
 
         self.assertEqual(
-            runner.commands[1][:4], ["netsh", "wlan", "delete", "profile"]
+            runner.commands[2][:4], ["netsh", "wlan", "delete", "profile"]
         )
         self.assertEqual(
-            runner.commands[2][:4], ["netsh", "wlan", "add", "profile"]
+            runner.commands[3][:4], ["netsh", "wlan", "add", "profile"]
         )
 
     @patch("ysu_net_watch.wifi.os.name", "nt")
     def test_missing_profile_can_be_rejected(self) -> None:
-        runner = SequenceRunner(1)
+        runner = SequenceRunner(0, 1)
         connector = WifiConnector(
             "iYanDa",
             create_open_profile=False,
@@ -158,11 +177,11 @@ class WifiConnectorTests(unittest.TestCase):
         with self.assertRaises(WifiError):
             connector.connect()
 
-        self.assertEqual(len(runner.commands), 1)
+        self.assertEqual(len(runner.commands), 2)
 
     @patch("ysu_net_watch.wifi.os.name", "nt")
     def test_transient_connect_failure_is_retried(self) -> None:
-        runner = SequenceRunner(0, 1, 0, ssid_result("iYanDa"))
+        runner = SequenceRunner(0, 0, 1, 0, ssid_result("iYanDa"))
         sleeps: list[float] = []
         connector = WifiConnector(
             "iYanDa",
@@ -186,6 +205,7 @@ class WifiConnectorTests(unittest.TestCase):
         runner = SequenceRunner(
             0,
             0,
+            0,
             *(ssid_result("Phone Hotspot") for _ in range(10)),
         )
         connector = WifiConnector(
@@ -196,6 +216,28 @@ class WifiConnectorTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(WifiError, "target SSID was not confirmed"):
+            connector.connect()
+
+    @patch("ysu_net_watch.wifi.os.name", "nt")
+    def test_netsh_failure_keeps_command_output(self) -> None:
+        runner = Mock(
+            side_effect=[
+                subprocess.CompletedProcess(
+                    [], 0, "", ""
+                ),
+                subprocess.CompletedProcess(
+                    [], 1, "The profile was not found.", ""
+                ),
+            ]
+        )
+        connector = WifiConnector(
+            "iYanDa",
+            create_open_profile=False,
+            runner=runner,
+            sleeper=lambda _seconds: None,
+        )
+
+        with self.assertRaisesRegex(WifiError, "The profile was not found"):
             connector.connect()
 
     def test_invalid_ssid_is_rejected(self) -> None:
