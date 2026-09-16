@@ -11,6 +11,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
+from .process import sanitized_child_environment, windows_system_executable
+
 
 class WifiError(RuntimeError):
     pass
@@ -44,28 +46,63 @@ class WifiConnector:
         *,
         create_open_profile: bool = True,
         settle_delay: float = 5.0,
+        command_cooldown: float = 90.0,
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         sleeper: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+        operation_allowed: Callable[[], bool] | None = None,
     ):
         if not ssid or len(ssid) > 32 or any(char in ssid for char in "\r\n\0"):
             raise WifiError("Wi-Fi SSID must contain 1 to 32 valid characters")
         self.ssid = ssid
         self.create_open_profile = create_open_profile
         self.settle_delay = max(0.0, settle_delay)
+        self.command_cooldown = max(0.0, command_cooldown)
         self.runner = runner
         self.sleeper = sleeper
+        self.clock = clock
+        self.operation_allowed = operation_allowed or (lambda: True)
+        self._cooldown_until = 0.0
+
+    def _require_active(self) -> None:
+        if not self.operation_allowed():
+            raise WifiError("Wi-Fi operation was cancelled")
+
+    def _sleep(self, seconds: float) -> None:
+        self._require_active()
+        self.sleeper(seconds)
+        self._require_active()
 
     def _run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+        self._require_active()
+        remaining = self._cooldown_until - self.clock()
+        if remaining > 0:
+            raise WifiError(
+                f"Windows Wi-Fi commands are cooling down after a timeout; "
+                f"retry in {remaining:.0f} seconds"
+            )
         try:
-            return self.runner(
-                command,
+            trusted_command = list(command)
+            if os.name == "nt" and trusted_command[0].casefold() == "netsh":
+                trusted_command[0] = windows_system_executable("netsh.exe")
+            result = self.runner(
+                trusted_command,
                 capture_output=True,
                 text=True,
                 errors="replace",
                 timeout=20,
                 check=False,
+                env=sanitized_child_environment(),
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._require_active()
+            return result
+        except subprocess.TimeoutExpired as exc:
+            self._cooldown_until = self.clock() + self.command_cooldown
+            raise WifiError(
+                f"Windows Wi-Fi command timed out; entering a "
+                f"{self.command_cooldown:g}-second cooldown: {exc}"
+            ) from exc
+        except OSError as exc:
             raise WifiError(
                 f"Windows Wi-Fi command could not be executed: {exc}"
             ) from exc
@@ -76,7 +113,17 @@ class WifiConnector:
         for value in (result.stderr, result.stdout):
             if value:
                 parts.append(str(value).strip())
-        return " ".join(" ".join(parts).split())[:240]
+        detail = " ".join(" ".join(parts).split())
+        # netsh output is external input from the local network stack.  Keep
+        # diagnostics single-line and terminal-safe before they reach a
+        # reporter or the event log.
+        detail = re.sub(
+            r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))",
+            "",
+            detail,
+        )
+        detail = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", detail)
+        return detail[:240]
 
     @classmethod
     def _failure_message(
@@ -189,7 +236,7 @@ class WifiConnector:
             and current.ssid.casefold() == self.ssid.casefold()
         ):
             if self.settle_delay:
-                self.sleeper(self.settle_delay)
+                self._sleep(self.settle_delay)
             return WifiConnectResult(self.ssid, profile_created=False)
 
         profile_created = False
@@ -219,7 +266,7 @@ class WifiConnector:
             raise WifiError(self._failure_message(message, auto))
 
         # Windows may need a moment to apply a newly added/updated profile.
-        self.sleeper(1.0)
+        self._sleep(1.0)
         connected = None
         for attempt in range(3):
             connected = self._run(
@@ -234,7 +281,7 @@ class WifiConnector:
             if connected.returncode == 0:
                 break
             if attempt < 2:
-                self.sleeper(2.0)
+                self._sleep(2.0)
         if connected is None or connected.returncode != 0:
             raise WifiError(
                 self._failure_message(
@@ -258,7 +305,7 @@ class WifiConnector:
             ):
                 break
             if verification_attempt < 9:
-                self.sleeper(1.0)
+                self._sleep(1.0)
         else:
             if last_info is not None and last_info.reason:
                 detail = f"; {last_info.reason}"
@@ -271,5 +318,6 @@ class WifiConnector:
                 f"but the target SSID was not confirmed{detail}"
             )
 
-        self.sleeper(self.settle_delay)
+        if self.settle_delay:
+            self._sleep(self.settle_delay)
         return WifiConnectResult(self.ssid, profile_created)
