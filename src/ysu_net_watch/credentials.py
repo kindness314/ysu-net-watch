@@ -5,6 +5,7 @@ import os
 from ctypes import wintypes
 from dataclasses import dataclass
 from typing import Protocol
+from .settings import valid_profile_id
 
 
 class CredentialError(RuntimeError):
@@ -37,6 +38,12 @@ WINDOWS_TARGETS = {
     "campus": "YSU-Net-Campus",
     "broadband": "YSU-Net-Broadband",
 }
+
+
+def profile_target(profile_id: str, revision: int = 1) -> str:
+    if not valid_profile_id(profile_id) or type(revision) is not int or not 1 <= revision <= 1_000_000:
+        raise CredentialError("无效的账号档案标识或凭据版本")
+    return f"YSU-Net-Watch-Profile-{profile_id}-r{revision}"
 
 
 class EnvironmentCredentialSource:
@@ -106,8 +113,8 @@ def _win_api():
 
 
 class WindowsCredentialSource:
-    def __init__(self, mode: str):
-        self.target = WINDOWS_TARGETS[mode]
+    def __init__(self, mode: str, profile_id: str | None = None, revision: int = 1):
+        self.target = profile_target(profile_id, revision) if profile_id is not None else WINDOWS_TARGETS[mode]
 
     def get(self) -> Credential:
         api = _win_api()
@@ -120,8 +127,23 @@ class WindowsCredentialSource:
 
         try:
             item = pointer.contents
-            blob = ctypes.string_at(item.CredentialBlob, item.CredentialBlobSize)
-            password = blob.decode("utf-16-le")
+            blob_size = int(item.CredentialBlobSize)
+            # Generic credentials are small; reject malformed/tampered
+            # metadata before allocating or decoding an unbounded blob.
+            if (
+                blob_size <= 0
+                or blob_size > 64 * 1024
+                or blob_size % 2
+                or not item.CredentialBlob
+            ):
+                raise CredentialError(f"Credential target {self.target!r} has an invalid credential blob")
+            blob = ctypes.string_at(item.CredentialBlob, blob_size)
+            try:
+                password = blob.decode("utf-16-le")
+            except UnicodeDecodeError as exc:
+                raise CredentialError(
+                    f"Credential target {self.target!r} contains invalid credential data"
+                ) from exc
             username = item.UserName or ""
             if not username or not password:
                 raise CredentialError(f"Credential target {self.target!r} is incomplete")
@@ -156,9 +178,12 @@ def build_credential_source(mode: str, source: str) -> CredentialSource:
     return EnvironmentCredentialSource(mode)
 
 
-def write_windows_credential(mode: str, username: str, password: str) -> None:
+def write_windows_credential(
+    mode: str, username: str, password: str, *,
+    profile_id: str | None = None, revision: int = 1,
+) -> None:
     api = _win_api()
-    target = WINDOWS_TARGETS[mode]
+    target = profile_target(profile_id, revision) if profile_id is not None else WINDOWS_TARGETS[mode]
     encoded = password.encode("utf-16-le")
     blob = (ctypes.c_ubyte * len(encoded)).from_buffer_copy(encoded)
     item = CREDENTIALW()
@@ -173,9 +198,11 @@ def write_windows_credential(mode: str, username: str, password: str) -> None:
         raise CredentialError(f"CredWrite failed with Windows error {ctypes.get_last_error()}")
 
 
-def delete_windows_credential(mode: str) -> None:
+def delete_windows_credential(
+    mode: str, *, profile_id: str | None = None, revision: int = 1,
+) -> None:
     api = _win_api()
-    target = WINDOWS_TARGETS[mode]
+    target = profile_target(profile_id, revision) if profile_id is not None else WINDOWS_TARGETS[mode]
     if not api.CredDeleteW(target, CRED_TYPE_GENERIC, 0):
         error = ctypes.get_last_error()
         if error != 1168:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from ysu_net_watch.wifi import (
@@ -30,7 +31,10 @@ class SequenceRunner:
         self.commands: list[list[str]] = []
 
     def __call__(self, command, **_kwargs):
-        self.commands.append(command)
+        recorded = list(command)
+        if Path(recorded[0]).name.casefold() == "netsh.exe":
+            recorded[0] = "netsh"
+        self.commands.append(recorded)
         value = next(self.results)
         if isinstance(value, tuple):
             return subprocess.CompletedProcess([], value[0], value[1], "")
@@ -38,6 +42,33 @@ class SequenceRunner:
 
 
 class WifiConnectorTests(unittest.TestCase):
+    @patch("ysu_net_watch.wifi.os.name", "nt")
+    def test_cancelled_operation_never_starts_netsh(self) -> None:
+        runner = Mock()
+        connector = WifiConnector(
+            runner=runner,
+            operation_allowed=lambda: False,
+        )
+        with self.assertRaisesRegex(WifiError, "cancelled"):
+            connector.connection_info()
+        runner.assert_not_called()
+
+    @patch("ysu_net_watch.wifi.os.name", "nt")
+    def test_cancellation_during_wait_stops_connection_sequence(self) -> None:
+        active = [True]
+        runner = SequenceRunner(0, 0)
+        def sleeper(_seconds):
+            active[0] = False
+        connector = WifiConnector(
+            create_open_profile=False,
+            runner=runner,
+            sleeper=sleeper,
+            operation_allowed=lambda: active[0],
+        )
+        with self.assertRaisesRegex(WifiError, "cancelled"):
+            connector.connect()
+        self.assertEqual(len(runner.commands), 2)
+
     def test_current_ssid_reads_connected_network(self) -> None:
         runner = Mock(
             return_value=subprocess.CompletedProcess(
@@ -243,6 +274,54 @@ class WifiConnectorTests(unittest.TestCase):
     def test_invalid_ssid_is_rejected(self) -> None:
         with self.assertRaises(WifiError):
             WifiConnector("invalid\nssid")
+
+    @patch("ysu_net_watch.wifi.os.name", "nt")
+    def test_netsh_timeout_starts_cooldown(self) -> None:
+        runner = Mock(side_effect=subprocess.TimeoutExpired(["netsh"], 20))
+        now = [100.0]
+        connector = WifiConnector(
+            runner=runner,
+            clock=lambda: now[0],
+            command_cooldown=90,
+        )
+
+        with self.assertRaisesRegex(WifiError, "90-second cooldown"):
+            connector.connection_info()
+        now[0] = 130.0
+        with self.assertRaisesRegex(WifiError, "retry in 60 seconds"):
+            connector.connection_info()
+
+        runner.assert_called_once()
+
+    @patch.dict(
+        "os.environ",
+        {
+            "YSU_BROADBAND_USERNAME": "student",
+            "YSU_BROADBAND_PASSWORD": "secret",
+        },
+    )
+    @patch(
+        "ysu_net_watch.wifi.windows_system_executable",
+        return_value=r"C:\Windows\System32\netsh.exe",
+    )
+    @patch("ysu_net_watch.wifi.os.name", "nt")
+    def test_netsh_uses_trusted_path_and_scrubbed_environment(
+        self,
+        _system_path: Mock,
+    ) -> None:
+        runner = Mock(
+            return_value=subprocess.CompletedProcess(
+                [], 0, "    Name : Wi-Fi\n    State : disconnected\n", ""
+            )
+        )
+
+        WifiConnector(runner=runner).connection_info()
+
+        command = runner.call_args.args[0]
+        child_env = runner.call_args.kwargs["env"]
+        self.assertEqual(command[0], r"C:\Windows\System32\netsh.exe")
+        self.assertNotIn("YSU_BROADBAND_USERNAME", child_env)
+        self.assertNotIn("YSU_BROADBAND_PASSWORD", child_env)
 
     @unittest.skipIf(os.name == "nt", "non-Windows behavior test")
     def test_non_windows_is_rejected(self) -> None:

@@ -8,6 +8,15 @@ from ysu_net_watch.monitor import JsonEventLog, sanitize_text
 
 
 class SanitizationTests(unittest.TestCase):
+    def test_terminal_control_sequences_and_newlines_are_removed(self) -> None:
+        clean = sanitize_text("ok\x1b[2J\x1b]0;spoof\x07\nnext\x00")
+
+        self.assertNotIn("\x1b", clean)
+        self.assertNotIn("\x00", clean)
+        self.assertNotIn("\n", clean)
+        self.assertIn("ok", clean)
+        self.assertIn("next", clean)
+
     def test_terminal_ip_and_mac_are_redacted(self) -> None:
         value = (
             "终端IP(10.53.29.172)，终端MAC（84:9e:56:77:1e:49） "
