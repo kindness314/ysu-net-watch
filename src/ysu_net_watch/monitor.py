@@ -15,6 +15,7 @@ from .connectivity import ConnectivityChecker, ConnectivityState
 from .credentials import CredentialError, CredentialSource
 from .portal import PortalClient, PortalError
 from .recovery import RecoveryState
+from .protection import AuthProtection, ProtectionError, TERMINAL_REASONS
 
 
 EXIT_OK = 0
@@ -28,7 +29,9 @@ EXIT_WIFI_FAILED = 40
 EXIT_ACCOUNT_LIMIT = 24
 EXIT_VERIFY_SKIPPED = 25
 EXIT_IP_BLOCKED = 26
-MAX_AUTH_ATTEMPTS = 5
+EXIT_AUTH_PROTECTED = 27
+EXIT_AUTH_COOLDOWN = 28
+MAX_AUTH_ATTEMPTS = 4
 
 EXIT_CODE_MESSAGES = {
     EXIT_OK: "正常结束或认证成功",
@@ -40,6 +43,8 @@ EXIT_CODE_MESSAGES = {
     EXIT_ACCOUNT_LIMIT: "账号在线设备数达到限制，已停止重试",
     EXIT_VERIFY_SKIPPED: "当前已有在线会话，未提交试验账号凭据",
     EXIT_IP_BLOCKED: "认证来源 IP 被门户冻结或封禁，已停止重试",
+    EXIT_AUTH_PROTECTED: "认证停止保护已生效，需确认处理后手动解除",
+    EXIT_AUTH_COOLDOWN: "认证冷却未结束，本次未提交；后续任务仍须等待共享冷却",
     EXIT_PROTOCOL_CHANGED: "认证门户协议发生变化，已停止提交",
     EXIT_WIFI_FAILED: "无法连接或配置指定 Wi-Fi",
 }
@@ -113,7 +118,8 @@ class WatchSettings:
     service: str
     check_interval: float = 60.0
     confirmation_delay: float = 120.0
-    retry_delays: tuple[float, ...] = (5.0, 10.0, 20.0, 40.0, 60.0)
+    # The last entry defines the attempt count; no sleep follows attempt four.
+    retry_delays: tuple[float, ...] = (300.0, 900.0, 1800.0, 1800.0)
     verification_delays: tuple[float, ...] = (3.0, 5.0)
 
     def __post_init__(self) -> None:
@@ -215,6 +221,8 @@ class Watcher:
         on_resume: Callable[[], None] | None = None,
         force_switch: bool = False,
         profile_id: str | None = None,
+        expected_network_name: str = "iYanDa",
+        protection: AuthProtection | None = None,
     ):
         self.settings = settings
         self.checker = checker
@@ -236,6 +244,8 @@ class Watcher:
         self._resume_pending = False
         self._switch_pending = force_switch
         self.profile_id = profile_id
+        self.expected_network_name = sanitize_text(expected_network_name)
+        self.protection = protection
         self.recovery = RecoveryState()
         self._last_failure: tuple[str, str, str] | None = None
 
@@ -274,7 +284,7 @@ class Watcher:
                 "portal_confirmation_skipped",
                 reason="current Wi-Fi is not the configured campus network",
             )
-            self.reporter("当前已不在 iYanDa，不执行校园网认证。")
+            self.reporter(f"当前已不在 {self.expected_network_name}，不执行校园网认证。")
             return False
         try:
             status = self.portal_factory().status()
@@ -324,15 +334,20 @@ class Watcher:
             if delay:
                 self.sleeper(delay)
             if not self._authentication_allowed():
-                return self._network_pending("认证已停止或当前已不在 iYanDa")
+                return self._network_pending(f"认证已停止或当前已不在 {self.expected_network_name}")
             verification = self.checker.check()
             if not self._authentication_allowed():
-                return self._network_pending("认证已停止或当前已不在 iYanDa")
+                return self._network_pending(f"认证已停止或当前已不在 {self.expected_network_name}")
             self.event_log.write(
                 "internet_verification", state=verification.state.value,
                 reason=verification.reason, secrets=secrets,
             )
             if verification.state == ConnectivityState.ONLINE:
+                if self.protection is not None and submitted is not False:
+                    try:
+                        self.protection.succeeded()
+                    except ProtectionError as exc:
+                        raise PortalError(exc.category, "authentication_protection", str(exc)) from exc
                 self._reset_recovery()
                 self._network_was_pending = False
                 self.event_log.write(
@@ -357,6 +372,8 @@ class Watcher:
                 raise
             if exc.category in {
                 "ip_blocked", "account_locked", "credential_rejected",
+                "mac_conflict", "mac_blocked", "rate_limited",
+                "authentication_protected", "authentication_cooldown", "protection_invalid",
                 "account_device_limit",
             }:
                 # An explicit account/source restriction in the portal status
@@ -372,6 +389,11 @@ class Watcher:
                 "portal confirmed offline after authentication and recovery checks",
             )
         self._reset_recovery()
+        if self.protection is not None and submitted is not False:
+            try:
+                self.protection.succeeded()
+            except ProtectionError as exc:
+                raise PortalError(exc.category, "authentication_protection", str(exc)) from exc
         return self._network_pending("门户已在线，但外网探测尚未通过", secrets=secrets)
 
     def _authenticate(self) -> int:
@@ -379,7 +401,7 @@ class Watcher:
         while self.recovery.failures < self.settings.max_attempts:
             attempt = self.recovery.failures + 1
             if not self._authentication_allowed():
-                return self._network_pending("认证已停止或当前已不在 iYanDa")
+                return self._network_pending(f"认证已停止或当前已不在 {self.expected_network_name}")
             # A changed Windows credential takes effect at the next attempt.
             try:
                 credential = self.credentials.get()
@@ -439,6 +461,20 @@ class Watcher:
                     reason=str(exc),
                 )
                 safe_reason = sanitize_text(str(exc), secrets)
+                if self.protection is not None and exc.category in TERMINAL_REASONS:
+                    try:
+                        self.protection.failed(exc.category)
+                    except ProtectionError as state_error:
+                        self.reporter(f"认证保护无法安全保存，停止提交：{state_error}")
+                        return EXIT_AUTH_PROTECTED
+                if exc.category in {
+                    "mac_conflict", "mac_blocked", "rate_limited",
+                    "authentication_protected", "authentication_cooldown", "protection_invalid",
+                }:
+                    self.reporter(f"认证保护已生效，停止提交：[{exc.stage}/{exc.category}] {safe_reason}")
+                    self.event_log.write("fatal", category=exc.category, reason=safe_reason,
+                                         attempts=attempt, profile_id=self.profile_id)
+                    return EXIT_AUTH_COOLDOWN if exc.category == "authentication_cooldown" else EXIT_AUTH_PROTECTED
                 if exc.category in {
                     "ip_blocked", "credential_rejected", "account_locked",
                     "account_device_limit",
@@ -513,6 +549,8 @@ class Watcher:
             failure_category=self._last_failure[1] if self._last_failure else None,
             reason=self._last_failure[2] if self._last_failure else "maximum authentication attempts reached",
         )
+        if self.protection is not None:
+            self.reporter("已达到四次认证上限，保持停止；请确认处理原因后在认证保护设置中手动解除。")
         return EXIT_AUTH_FAILED
 
     def run(self, once: bool = False, authenticate_on_start: bool = False) -> int:
@@ -543,12 +581,18 @@ class Watcher:
                 self._resume_pending = False
                 # The morning window is a new recovery episode, unlike a timeout.
                 self._reset_recovery()
-                authenticate_on_start = True
+                # Overnight selection is not permission to tear down a link
+                # that stayed online. Re-enter ordinary probes/confirmation
+                # before reading credentials, even if portal status is stale.
+                authenticate_on_start = False
+                self._switch_pending = False
+                self.event_log.write("resume_connectivity_check_required")
+                self.reporter("恢复后先检查互联网；已在线则只监听，不重新认证。")
             if authenticate_on_start:
                 authenticate_on_start = False
                 if not self._on_expected_network():
                     self.event_log.write("startup_authentication_skipped", mode=self.settings.mode)
-                    self.reporter("未确认当前连接 iYanDa，跳过首次认证。")
+                    self.reporter(f"未确认当前连接 {self.expected_network_name}，跳过首次认证。")
                 else:
                     self.event_log.write("startup_authentication", mode=self.settings.mode,
                                          service=self.settings.service)

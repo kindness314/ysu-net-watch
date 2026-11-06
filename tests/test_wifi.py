@@ -43,6 +43,14 @@ class SequenceRunner:
 
 class WifiConnectorTests(unittest.TestCase):
     @patch("ysu_net_watch.wifi.os.name", "nt")
+    def test_scan_reads_ssids_without_bssids_duplicates_or_control_characters(self):
+        runner = Mock(return_value=subprocess.CompletedProcess([], 0,
+            "SSID 1 : iYanDa\nSSID 2 : Campus AP\nSSID 3 : iYanDa\n"
+            "SSID 4 : bad\x1bName\nSSID 5 : \nBSSID 1 : 00:11:22:33:44:55\n", ""))
+        self.assertEqual(WifiConnector(runner=runner).available_ssids(), ["iYanDa", "Campus AP"])
+        self.assertEqual(runner.call_args.args[0][1:], ["wlan", "show", "networks", "mode=ssid"])
+
+    @patch("ysu_net_watch.wifi.os.name", "nt")
     def test_cancelled_operation_never_starts_netsh(self) -> None:
         runner = Mock()
         connector = WifiConnector(

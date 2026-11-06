@@ -14,34 +14,34 @@ from ysu_net_watch.recovery import RecoveryState
 class RecoveryTests(unittest.TestCase):
     def watcher(self, factory, checker=None):
         return Watcher(
-            WatchSettings("broadband", "中国电信", retry_delays=(0,) * 5,
+            WatchSettings("broadband", "中国电信", retry_delays=(0,) * 4,
                           verification_delays=(), confirmation_delay=0, check_interval=0),
             checker or Mock(check=Mock(return_value=ConnectivityResult(ConnectivityState.ONLINE, "test"))),
             Mock(get=Mock(return_value=Credential("synthetic-user", "synthetic-password"))),
             factory, Mock(), sleeper=lambda _: None, reporter=Mock(),
         )
 
-    def test_four_rejections_timeout_then_fifth_rejection_stops(self):
+    def test_three_rejections_status_timeout_then_fourth_rejection_stops(self):
         rejected = PortalError("authentication_failed", "service_login", "synthetic rejection")
         portal = Mock()
-        portal.login.side_effect = [rejected] * 4 + [PortalError("timeout", "status", "timeout"), rejected]
+        portal.login.side_effect = [rejected] * 3 + [PortalError("timeout", "status", "timeout"), rejected]
         watcher = self.watcher(lambda: portal)
         self.assertEqual(watcher._authenticate(), 21)
-        self.assertEqual(watcher.recovery.failures, 4)
+        self.assertEqual(watcher.recovery.failures, 3)
         self.assertEqual(watcher._authenticate(), 20)
-        self.assertEqual(portal.login.call_count, 6)
+        self.assertEqual(portal.login.call_count, 5)
         failures = [call.kwargs["attempt"] for call in watcher.event_log.inner.write.call_args_list
                     if call.args == ("authentication_failed",)]
-        self.assertEqual(failures, [1, 2, 3, 4, 5])
+        self.assertEqual(failures, [1, 2, 3, 4])
 
     def test_continuous_monitor_does_not_reset_budget_between_checks(self):
         rejected = PortalError("authentication_failed", "service_login", "rejected")
         portal = Mock()
-        portal.login.side_effect = [rejected] * 4 + [PortalError("timeout", "status", "timeout"), rejected]
+        portal.login.side_effect = [rejected] * 3 + [PortalError("timeout", "status", "timeout"), rejected]
         checker = Mock(check=Mock(return_value=ConnectivityResult(ConnectivityState.CAPTIVE, "test")))
         watcher = self.watcher(lambda: portal, checker)
         self.assertEqual(watcher.run(authenticate_on_start=True), 20)
-        self.assertEqual(portal.login.call_count, 6)
+        self.assertEqual(portal.login.call_count, 5)
 
     def test_transport_errors_do_not_consume_or_erase_budget(self):
         portal = Mock()
@@ -55,7 +55,7 @@ class RecoveryTests(unittest.TestCase):
     def test_confirmed_online_resets_all_recovery_limits(self):
         portal = Mock(login=Mock(return_value=True))
         watcher = self.watcher(lambda: portal)
-        watcher.recovery.failures = 4
+        watcher.recovery.failures = 3
         watcher.recovery.device_release_attempted = True
         watcher.recovery.workflow_session_retry_attempted = True
         self.assertEqual(watcher._authenticate(), 0)
@@ -65,7 +65,7 @@ class RecoveryTests(unittest.TestCase):
         portal = Mock(login=Mock(return_value=True), status=Mock(return_value=SimpleNamespace(online=True)))
         checker = Mock(check=Mock(return_value=ConnectivityResult(ConnectivityState.UNKNOWN, "test")))
         watcher = self.watcher(lambda: portal, checker)
-        watcher.recovery.failures = 4
+        watcher.recovery.failures = 3
         self.assertEqual(watcher._authenticate(), 21)
         self.assertEqual(watcher.recovery.failures, 0)
 

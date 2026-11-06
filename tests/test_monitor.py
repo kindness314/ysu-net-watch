@@ -99,7 +99,7 @@ class WatcherTests(unittest.TestCase):
             service="校园网",
             check_interval=0,
             confirmation_delay=0,
-            retry_delays=(0, 0, 0, 0, 0),
+            retry_delays=(0, 0, 0, 0),
         )
         self.credential = Credential("student42", "super-secret")
 
@@ -107,7 +107,7 @@ class WatcherTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             WatchSettings("campus", "校园网", retry_delays=())
         with self.assertRaises(ValueError):
-            WatchSettings("campus", "校园网", retry_delays=(0,) * 6)
+            WatchSettings("campus", "校园网", retry_delays=(0,) * 5)
         with self.assertRaises(ValueError):
             WatchSettings("campus", "校园网", retry_delays=(float("inf"),))
 
@@ -257,7 +257,7 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(portal.login_calls, 0)
         self.assertEqual(credentials.calls, 0)
 
-    def test_five_transient_authentication_failures_exit_and_are_logged(self) -> None:
+    def test_four_transient_authentication_failures_exit_and_are_logged(self) -> None:
         failure = PortalError(
             "authentication_failed",
             "service_login",
@@ -278,7 +278,7 @@ class WatcherTests(unittest.TestCase):
         events = self.events()
         failures = [event for event in events if event["event"] == "authentication_failed"]
         fatals = [event for event in events if event["event"] == "fatal"]
-        self.assertEqual(len(failures), 5)
+        self.assertEqual(len(failures), 4)
         self.assertEqual(len(fatals), 1)
         raw_log = self.log_path.read_text(encoding="utf-8")
         self.assertNotIn("student42", raw_log)
@@ -542,7 +542,7 @@ class WatcherTests(unittest.TestCase):
         fatal = next(e for e in self.events() if e["event"] == "fatal")
         self.assertEqual(fatal["category"], "ip_blocked")
 
-    def test_portal_confirmed_offline_after_grace_still_stops_at_five(self) -> None:
+    def test_portal_confirmed_offline_after_grace_still_stops_at_four(self) -> None:
         portal = Mock()
         portal.status.return_value = SimpleNamespace(online=False)
         watcher = self.watcher(
@@ -550,7 +550,7 @@ class WatcherTests(unittest.TestCase):
             StaticCredentials(self.credential), lambda: portal,
         )
         self.assertEqual(watcher.run(once=True, authenticate_on_start=True), EXIT_AUTH_FAILED)
-        self.assertEqual(portal.login.call_count, 5)
+        self.assertEqual(portal.login.call_count, 4)
         fatal = next(e for e in self.events() if e["event"] == "fatal")
         self.assertEqual(fatal["stage"], "verify_login")
         self.assertIn("confirmed offline", fatal["reason"])

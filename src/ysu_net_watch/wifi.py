@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Callable
 
 from .process import sanitized_child_environment, windows_system_executable
+from .settings import valid_wifi_ssid
 
 
 class WifiError(RuntimeError):
@@ -52,7 +53,7 @@ class WifiConnector:
         clock: Callable[[], float] = time.monotonic,
         operation_allowed: Callable[[], bool] | None = None,
     ):
-        if not ssid or len(ssid) > 32 or any(char in ssid for char in "\r\n\0"):
+        if not valid_wifi_ssid(ssid):
             raise WifiError("Wi-Fi SSID must contain 1 to 32 valid characters")
         self.ssid = ssid
         self.create_open_profile = create_open_profile
@@ -164,6 +165,23 @@ class WifiConnector:
 
     def current_ssid(self) -> str | None:
         return self.connection_info().ssid
+
+    def enable_radio(self) -> bool:
+        from .radio import WifiRadio
+        return WifiRadio(runner=self.runner, operation_allowed=self.operation_allowed).ensure_on()
+
+    def available_ssids(self) -> list[str]:
+        if os.name != "nt":
+            raise WifiError("Wi-Fi 扫描仅支持 Windows")
+        result = self._run(["netsh", "wlan", "show", "networks", "mode=ssid"])
+        if result.returncode != 0:
+            raise WifiError(self._failure_message("Wi-Fi scan failed", result))
+        names = []
+        for line in (result.stdout or "").splitlines():
+            match = re.match(r"^\s*SSID\s+\d+\s*:\s(.*)$", line)
+            if match and valid_wifi_ssid(match.group(1)) and match.group(1) not in names:
+                names.append(match.group(1))
+        return names
 
     def _add_open_profile(self) -> None:
         escaped_ssid = html.escape(self.ssid, quote=False)
