@@ -18,6 +18,17 @@ SETTINGS_LOCK = threading.RLock()
 MAX_PROFILES = 20
 
 
+def valid_wifi_ssid(value: object) -> bool:
+    if not isinstance(value, str) or not value or any(
+        ord(ch) < 32 or 127 <= ord(ch) <= 159 for ch in value
+    ):
+        return False
+    try:
+        return len(value.encode("utf-8")) <= 32
+    except UnicodeEncodeError:
+        return False
+
+
 def valid_profile_id(value: object) -> bool:
     if not isinstance(value, str):
         return False
@@ -98,6 +109,10 @@ class AppSettings:
     profiles: tuple[AccountProfile, ...] = field(default_factory=legacy_profiles)
     default_profile_ids: dict[str, str] = field(default_factory=legacy_defaults)
     night_pause_enabled: bool = True
+    auto_watch_on_start: bool = False
+    auto_enable_wifi: bool = False
+    wifi_ssid: str = "iYanDa"
+    automatic_wifi_policy: str = "preserve"
     # Only an opaque profile ID is remembered, never credentials.
     last_selected_profile_id: str | None = field(
         default_factory=lambda: legacy_profile_id("unicom"),
@@ -141,6 +156,13 @@ def load_settings(path: Path | None = None) -> AppSettings:
         raise ValueError("设置文件损坏，已停止读取账号；请恢复设置备份") from exc
     if not isinstance(payload, dict):
         raise ValueError("设置格式无效，已停止读取账号")
+    auto_watch = payload.get("auto_watch_on_start", False)
+    auto_enable = payload.get("auto_enable_wifi", False)
+    if type(auto_enable) is not bool:
+        raise ValueError("自动开启 Wi-Fi 开关无效")
+    wifi_ssid = payload.get("wifi_ssid", "iYanDa")
+    wifi_policy = payload.get("automatic_wifi_policy", "preserve")
+    _validate_startup_preferences(auto_watch, wifi_ssid, wifi_policy)
     schema_version = payload.get("schema_version")
     if schema_version is not None and type(schema_version) is not int:
         raise ValueError("设置版本字段无效，已停止读取账号")
@@ -236,6 +258,10 @@ def load_settings(path: Path | None = None) -> AppSettings:
         profiles=profiles,
         default_profile_ids=defaults,
         night_pause_enabled=payload.get("night_pause_enabled", True) is not False,
+        auto_watch_on_start=auto_watch,
+        auto_enable_wifi=auto_enable,
+        wifi_ssid=wifi_ssid,
+        automatic_wifi_policy=wifi_policy,
         last_selected_profile_id=selected_id if isinstance(selected_id, str) else None,
     ))
 
@@ -335,7 +361,21 @@ def _parse_timer(value: object) -> TimerSettings:
     )
 
 
+def _validate_startup_preferences(auto_watch, wifi_ssid, wifi_policy) -> None:
+    if type(auto_watch) is not bool:
+        raise ValueError("启动自动监听开关无效")
+    if not valid_wifi_ssid(wifi_ssid):
+        raise ValueError("指定 Wi-Fi 名称无效：需要 1～32 字节，不能包含控制字符")
+    if not isinstance(wifi_policy, str) or wifi_policy not in {"preserve", "switch"}:
+        raise ValueError("自动网络切换策略无效")
+
+
 def save_settings(settings: AppSettings, path: Path | None = None) -> Path:
+    if type(settings.auto_enable_wifi) is not bool:
+        raise ValueError("自动开启 Wi-Fi 开关无效")
+    _validate_startup_preferences(
+        settings.auto_watch_on_start, settings.wifi_ssid, settings.automatic_wifi_policy,
+    )
     settings = follow_last_selection(settings)
     if not 1 <= len(settings.timers) <= MAX_TIMERS:
         raise ValueError("定时器数量无效")

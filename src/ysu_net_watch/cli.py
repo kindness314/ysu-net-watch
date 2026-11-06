@@ -6,6 +6,7 @@ import re
 import signal
 import sys
 import threading
+import time
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +22,8 @@ from .credentials import (
 )
 from .monitor import (
     EXIT_ACCOUNT_LIMIT,
+    EXIT_AUTH_PROTECTED,
+    EXIT_AUTH_COOLDOWN,
     EXIT_CREDENTIAL_REJECTED,
     EXIT_IP_BLOCKED,
     EXIT_NETWORK_UNCONFIRMED,
@@ -36,7 +39,9 @@ from .monitor import (
     sanitize_text,
 )
 from .instance import AlreadyRunningError, SingleInstanceLock
+from .startup import StartupManager, startup_command
 from .portal import PortalClient, PortalError
+from .protection import AuthProtection, ProtectionError, TERMINAL_REASONS
 from .schedule import (
     TimerRun,
     TimerSchedule,
@@ -58,6 +63,7 @@ from .settings import (
     select_profile,
     valid_time,
     service_key,
+    valid_wifi_ssid,
 )
 from .ui import select_menu
 from .wifi import (
@@ -86,22 +92,58 @@ DAY_NAMES = ("周一", "周二", "周三", "周四", "周五", "周六", "周日
 def scheduled_skip_reason(
     current_ssid: str | None,
     current_state: ConnectivityState | None = None,
+    *,
+    target_ssid: str = "iYanDa",
+    allow_switch: bool = False,
 ) -> str:
-    if current_ssid and current_ssid.casefold() != "iYanDa".casefold():
+    if current_ssid and current_ssid.casefold() != target_ssid.casefold() and not allow_switch:
         return f"当前连接其他 Wi-Fi（{current_ssid}）"
     if current_ssid is None:
-        return "无法确认当前 Wi-Fi 是否为 iYanDa"
+        return f"无法确认当前 Wi-Fi 是否为 {target_ssid}"
     return ""
 
 
-def scheduled_wifi_skip_reason(connection: WifiConnectionInfo) -> str:
+def scheduled_wifi_skip_reason(
+    connection: WifiConnectionInfo, *, target_ssid: str = "iYanDa", allow_switch: bool = False,
+) -> str:
     if connection.state == WifiConnectionState.CONNECTED:
-        return scheduled_skip_reason(connection.ssid)
+        return scheduled_skip_reason(connection.ssid, target_ssid=target_ssid, allow_switch=allow_switch)
     if connection.state == WifiConnectionState.DISCONNECTED:
         return ""
     if connection.reason:
         return f"无法确认无线网卡或 Wi-Fi 连接状态：{connection.reason}"
     return "无法确认无线网卡或 Wi-Fi 连接状态"
+
+
+def apply_console_wifi_options(args, config: AppSettings) -> None:
+    args.wifi_ssid = config.wifi_ssid
+    # Custom networks must already have a Windows profile. Never overwrite a
+    # secured network with an open profile or store its Wi-Fi password here.
+    args.create_wifi_profile = config.wifi_ssid == "iYanDa"
+    args.automatic_wifi_policy = config.automatic_wifi_policy
+    args.auto_enable_wifi = config.auto_enable_wifi
+
+
+def wait_for_startup_wifi(connector, stop_event, reporter) -> WifiConnectionInfo:
+    deadline = time.monotonic() + 180
+    connection = WifiConnectionInfo(WifiConnectionState.UNKNOWN, reason="无线网卡尚未就绪")
+    for attempt in range(12):
+        if stop_event.is_set():
+            return WifiConnectionInfo(WifiConnectionState.UNKNOWN, reason="已取消")
+        try:
+            connection = connector.connection_info()
+        except WifiError as exc:
+            connection = WifiConnectionInfo(WifiConnectionState.UNKNOWN, reason=str(exc))
+        if connection.state != WifiConnectionState.UNKNOWN or current_pause_reason():
+            return connection
+        if attempt == 0:
+            reporter("启动后等待无线网卡就绪（约 3 分钟内，停止监听可取消）。")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if attempt < 11 and stop_event.wait(min(15, remaining)):
+            break
+    return connection
 
 
 def choose_mode(mode: str | None, service: str | None) -> tuple[str, str]:
@@ -185,6 +227,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("status", help="查询门户在线状态")
+    protection_parser = subparsers.add_parser("protection", help="查看或手动解除认证保护（不读取账密）")
+    protection_sub = protection_parser.add_subparsers(dest="protection_command", required=True)
+    protection_sub.add_parser("status", help="只读查看提交次数、冷却和停止原因")
+    protection_reset = protection_sub.add_parser("reset", help="确认旧会话/冻结问题已处理后解除保护")
+    protection_reset.add_argument("--confirm", action="store_true", help="明确确认已处理原因；仍保留最少五分钟提交间隔")
 
     credential = subparsers.add_parser("credential", help="管理 Windows 凭据")
     credential_sub = credential.add_subparsers(dest="credential_command", required=True)
@@ -282,6 +329,8 @@ def run_login(args: argparse.Namespace) -> int:
         return code
 
     for candidate in next_account_profiles(profile):
+        if code := wait_for_authentication_window(threading.Event(), print):
+            return code
         print(
             f"账号“{sanitize_text(profile.label)}”达到认证设备数限制，"
             f"按账号表顺序尝试“{sanitize_text(candidate.label)}”。"
@@ -308,6 +357,67 @@ def run_login(args: argparse.Namespace) -> int:
     return EXIT_ACCOUNT_LIMIT
 
 
+def authentication_precheck(protection: AuthProtection, reporter=print) -> int:
+    try:
+        protection.check()
+    except ProtectionError as exc:
+        code = EXIT_AUTH_COOLDOWN if exc.category == "authentication_cooldown" else EXIT_AUTH_PROTECTED
+        reporter(f"{exc}；{exit_code_text(code)}")
+        return code
+    return 0
+
+
+def wait_for_authentication_window(stop_event: threading.Event, reporter=print) -> int:
+    """Optional account fallback shares the same delay and four-submit budget."""
+    protection = AuthProtection()
+    announced = False
+    while not stop_event.is_set():
+        try:
+            protection.check()
+            return 0
+        except ProtectionError as exc:
+            if exc.category != "authentication_cooldown":
+                reporter(f"{exc}；{exit_code_text(EXIT_AUTH_PROTECTED)}")
+                return EXIT_AUTH_PROTECTED
+            if not announced:
+                reporter(f"账号顺序回退等待共享冷却：{exc}；可停止监听取消。")
+                announced = True
+            try:
+                remaining = protection.status()["remaining_seconds"]
+            except ProtectionError as state_error:
+                reporter(str(state_error))
+                return EXIT_AUTH_PROTECTED
+            stop_event.wait(min(60.0, max(1.0, remaining)))
+    return 0
+
+
+def run_protection(args: argparse.Namespace) -> int:
+    protection = AuthProtection()
+    try:
+        if args.protection_command == "reset":
+            if not args.confirm:
+                print("未解除保护：请先确认旧会话已释放、冻结已解除或凭据已修正，再加 --confirm。")
+                return 2
+            protection.reset()
+            print("认证保护已手动解除；仍保留最少五分钟提交间隔，不会自动开始认证。")
+        state = protection.status()
+        print(f"认证提交：{state['submissions']}/{state['limit']}；{state['reason']}；冷却剩余 {state['remaining_seconds']} 秒")
+        return 0
+    except ProtectionError as exc:
+        print(f"{exc}；{exit_code_text(EXIT_AUTH_PROTECTED)}")
+        return EXIT_AUTH_PROTECTED
+
+
+def persist_terminal_restriction(protection: AuthProtection, error: PortalError, reporter=print) -> bool:
+    if error.category in TERMINAL_REASONS:
+        try:
+            protection.failed(error.category)
+        except ProtectionError as exc:
+            reporter(str(exc))
+            return False
+    return True
+
+
 def _run_login_once(
     args: argparse.Namespace,
     mode: str,
@@ -316,6 +426,9 @@ def _run_login_once(
     *,
     remember_selection: bool,
 ) -> int:
+    protection = AuthProtection()
+    if code := authentication_precheck(protection):
+        return code
     if profile is not None and remember_selection:
         ProfileStore().remember_selection(profile.id)
     if reason := current_pause_reason():
@@ -344,7 +457,7 @@ def _run_login_once(
             return EXIT_PLANNED_PAUSE
         credential = source.get()
         connector = WifiConnector(args.wifi_ssid, create_open_profile=False)
-        portal = PortalClient(operation_allowed=lambda: (
+        portal = PortalClient(protection=protection, operation_allowed=lambda: (
             not current_pause_reason()
             and (connector.current_ssid() or "").casefold() == args.wifi_ssid.casefold()
         ))
@@ -357,6 +470,8 @@ def _run_login_once(
         print(f"缺少凭据：{exc}；{exit_code_text(10)}", file=sys.stderr)
         return 10
     except PortalError as exc:
+        if not persist_terminal_restriction(protection, exc):
+            return EXIT_AUTH_PROTECTED
         if reason := current_pause_reason():
             print(reason)
             return EXIT_PLANNED_PAUSE
@@ -368,7 +483,11 @@ def _run_login_once(
         network_unconfirmed = exc.category in {"timeout", "network_error", "operation_cancelled"}
         label = "网络暂未确认" if network_unconfirmed else "认证失败"
         code = (
-            EXIT_NETWORK_UNCONFIRMED
+            EXIT_AUTH_COOLDOWN
+            if exc.category == "authentication_cooldown"
+            else EXIT_AUTH_PROTECTED
+            if exc.category in {"mac_conflict", "mac_blocked", "rate_limited", "authentication_protected", "authentication_cooldown", "protection_invalid"}
+            else EXIT_NETWORK_UNCONFIRMED
             if network_unconfirmed
             else EXIT_IP_BLOCKED
             if exc.category == "ip_blocked"
@@ -385,6 +504,8 @@ def _run_login_once(
             f"{sanitize_text(str(exc), secrets)}；{exit_code_text(code)}",
             file=sys.stderr,
         )
+        if code in {EXIT_AUTH_PROTECTED, EXIT_AUTH_COOLDOWN}:
+            return code
         if network_unconfirmed:
             return EXIT_NETWORK_UNCONFIRMED
         if exc.category == "ip_blocked":
@@ -479,6 +600,11 @@ def run_watch(
     profile_changed: Callable[[AccountProfile], None] | None = None,
 ) -> int:
     stop_event = external_stop_event or threading.Event()
+    if stop_event.is_set():
+        return 0
+    protection = AuthProtection()
+    if code := authentication_precheck(protection, reporter):
+        return code
 
     def stop(_signum, _frame):
         stop_event.set()
@@ -518,6 +644,34 @@ def run_watch(
         operation_allowed=lambda: not stop_event.is_set(),
     )
     paused = current_pause_reason()
+    if args.auto_wifi and getattr(args, "auto_enable_wifi", False) and not paused:
+        try:
+            changed = wifi_connector.enable_radio()
+            reporter("已自动打开 Wi-Fi 软件开关。" if changed else "Wi-Fi 软件开关已开启。")
+            event_log.write("wifi_radio_ready", changed=changed)
+        except WifiError as exc:
+            if stop_event.is_set():
+                return 0
+            event_log.write("fatal", category="wifi_radio_failed", reason=str(exc))
+            reporter(f"自动开启 Wi-Fi 失败：{sanitize_text(str(exc))}；{exit_code_text(EXIT_WIFI_FAILED)}")
+            return EXIT_WIFI_FAILED
+        if stop_event.is_set():
+            return 0
+        paused = current_pause_reason()
+    if getattr(args, "automatic_start", False) and args.auto_wifi and not paused:
+        connection = wait_for_startup_wifi(wifi_connector, stop_event, reporter)
+        if stop_event.is_set():
+            return 0
+        paused = current_pause_reason()
+        if not paused:
+            skip_reason = scheduled_wifi_skip_reason(
+                connection, target_ssid=args.wifi_ssid,
+                allow_switch=getattr(args, "automatic_wifi_policy", "preserve") == "switch",
+            )
+            if skip_reason:
+                reporter(f"启动自动监听已跳过：{sanitize_text(skip_reason)}")
+                event_log.write("startup_watch_skipped", reason=skip_reason)
+                return EXIT_WIFI_FAILED if connection.state == WifiConnectionState.UNKNOWN else 0
     if args.auto_wifi and not paused:
         try:
             wifi = wifi_connector.connect()
@@ -555,7 +709,10 @@ def run_watch(
         authenticate_on_start = initial.state != ConnectivityState.ONLINE
         if authenticate_on_start:
             reporter("首次启动后外网不可用，立即尝试认证。")
-    force_switch = bool(args.profile or getattr(args, "switch_on_start", False))
+    force_switch = (
+        not getattr(args, "automatic_start", False)
+        and bool(args.profile or getattr(args, "switch_on_start", False))
+    )
     authenticate_on_start = authenticate_on_start or force_switch or bool(paused)
 
     def expected_network() -> bool:
@@ -572,9 +729,15 @@ def run_watch(
     def on_resume() -> None:
         if not args.auto_wifi:
             return
+        if getattr(args, "auto_enable_wifi", False):
+            wifi_connector.enable_radio()
         # A phone hotspot remains untouched when the planned outage ends.
         connection = wifi_connector.connection_info()
-        if connection.state == WifiConnectionState.DISCONNECTED:
+        if connection.state == WifiConnectionState.DISCONNECTED or (
+            connection.state == WifiConnectionState.CONNECTED and connection.ssid
+            and connection.ssid.casefold() != args.wifi_ssid.casefold()
+            and getattr(args, "automatic_wifi_policy", "preserve") == "switch"
+        ):
             wifi_connector.connect()
         elif connection.state == WifiConnectionState.UNKNOWN:
             raise WifiError(
@@ -587,6 +750,7 @@ def run_watch(
         credentials=selected_credential_source(args, mode, profile),
         portal_factory=lambda: PortalClient(
             reporter=reporter, sleeper=stop_event.wait, operation_allowed=operation_allowed,
+            protection=protection, confirm_success=False,
         ),
         event_log=event_log,
         stop_event=stop_event,
@@ -596,6 +760,8 @@ def run_watch(
         on_resume=on_resume,
         force_switch=force_switch,
         profile_id=profile.id if profile else None,
+        expected_network_name=args.wifi_ssid,
+        protection=protection,
     )
     reporter(f"开始监听：{service}。")
     result = watcher.run(
@@ -614,6 +780,10 @@ def run_watch(
             reporter("当前使用环境变量凭据，未启用账号表顺序回退。")
         return result
     for candidate in next_account_profiles(profile):
+        if code := wait_for_authentication_window(stop_event, reporter):
+            return code
+        if stop_event.is_set():
+            return 0
         reporter(
             f"账号“{sanitize_text(profile.label)}”达到认证设备数限制，"
             f"按账号表顺序尝试“{sanitize_text(candidate.label)}”。"
@@ -740,6 +910,7 @@ def run_console(
         *,
         scheduled_run: TimerRun | None = None,
         profile_id: str | None = None,
+        automatic_start: bool = False,
     ) -> bool:
         nonlocal worker, worker_stop, active_mode, active_service
         nonlocal active_profile_id, active_revision
@@ -757,7 +928,7 @@ def run_console(
                 return False
             if not stop_worker():
                 return False
-            if scheduled_run is None:
+            if scheduled_run is None and not automatic_start:
                 try:
                     config = account_store.remember_selection(profile.id)
                     schedule.sync(config.timers, config.profiles)
@@ -774,6 +945,10 @@ def run_console(
             if try_next_account:
                 command.append("--try-next-account")
             watch_args = build_parser().parse_args(command)
+            apply_console_wifi_options(watch_args, load_settings())
+            # A timer is observation/recovery, not an explicit account switch.
+            # Sharing startup's online check avoids logging out a working link.
+            watch_args.automatic_start = automatic_start or scheduled_run is not None
             new_stop = threading.Event()
             token = generation
 
@@ -909,9 +1084,16 @@ def run_console(
                 accepted = True
                 finish_conflicts(due[1:], now.date())
                 return
-            connector = WifiConnector("iYanDa", create_open_profile=False, settle_delay=0)
+            connector = WifiConnector(settings.wifi_ssid, create_open_profile=False, settle_delay=0)
+            if settings.auto_enable_wifi:
+                changed = connector.enable_radio()
+                if changed:
+                    update_status("定时任务已自动打开 Wi-Fi 软件开关。")
             connection = connector.connection_info()
-            skip_reason = scheduled_wifi_skip_reason(connection)
+            skip_reason = scheduled_wifi_skip_reason(
+                connection, target_ssid=settings.wifi_ssid,
+                allow_switch=settings.automatic_wifi_policy == "switch",
+            )
             timer_name = f"定时器 {selected.index + 1}"
             phase_name = "补偿" if selected.phase == "retry" else "主任务"
             if skip_reason:
@@ -947,7 +1129,10 @@ def run_console(
         nonlocal scheduler_health
         with operation_lock:
             scheduler_health = f"异常后等待重试（{type(exc).__name__}）"
-        update_status(f"定时调度异常（{type(exc).__name__}），15 秒后继续检查；本次主任务失败可触发所设补偿。")
+        if isinstance(exc, WifiError):
+            update_status(f"定时任务网络准备失败：{sanitize_text(str(exc))}；未提交认证。")
+        else:
+            update_status(f"定时调度异常（{type(exc).__name__}），15 秒后继续检查；本次主任务失败可触发所设补偿。")
         scheduler_log("scheduler_error", category=type(exc).__name__, reason=str(exc))
 
     def scheduler_recovered() -> None:
@@ -1134,6 +1319,7 @@ def run_console(
                 verify_args = build_parser().parse_args(
                     ["account", "verify", "--profile", profile.id]
                 )
+                apply_console_wifi_options(verify_args, load_settings())
                 result = run_account_verify(verify_args)
                 if result == EXIT_VERIFY_SKIPPED:
                     follow_up = select_menu(
@@ -1186,8 +1372,8 @@ def run_console(
     def configure_night_pause() -> None:
         config = load_settings()
         print(
-            f"夜间保护在周一至周四 23:30 起生效，至次日 "
-            f"{config.timers[0].time} 恢复；星期五恢复后至周一 23:30 不暂停。"
+            f"夜间保护在周日及周一至周四 23:30 起生效，至次日 "
+            f"{config.timers[0].time} 恢复；星期五恢复后至周日 23:30 不暂停。"
         )
         value = ask_time("夜间保护恢复时间（同时更新定时器 1 时间）", config.timers[0].time)
         if value is not None:
@@ -1346,6 +1532,130 @@ def run_console(
                 return
             edit_timer(choice)
 
+    def save_network_preferences(config: AppSettings) -> None:
+        with worker_control_lock:
+            if not stop_worker():
+                print("监听尚未停止，网络设置未更改。")
+                return
+            save_console_settings(config)
+        print("网络设置已保存；原监听已停止，下次启动监听使用新设置。")
+
+    def choose_wifi() -> None:
+        config = load_settings()
+        choice = select_menu(
+            f"指定 Wi-Fi（当前 {config.wifi_ssid}）：",
+            ["扫描并选择附近 Wi-Fi", "手动输入 Wi-Fi 名称", "恢复 iYanDa", "返回"],
+        )
+        selected = None
+        if choice == 0:
+            try:
+                names = WifiConnector(create_open_profile=False).available_ssids()
+            except WifiError as exc:
+                print(f"扫描失败：{sanitize_text(str(exc))}；可使用手动输入。")
+                return
+            if not names:
+                print("没有扫描到 Wi-Fi；请检查无线开关或使用手动输入。")
+                return
+            if len(names) > 10:
+                print("仅显示前 10 个网络，其余网络可手动输入名称。")
+            names = names[:10]
+            index = select_menu("选择指定 Wi-Fi：", [*names, "返回"])
+            if index is not None and index < len(names):
+                selected = names[index]
+        elif choice == 1:
+            selected = input("Wi-Fi 名称（区分大小写；留空返回）：")
+            if not selected:
+                return
+        elif choice == 2:
+            selected = "iYanDa"
+        if selected is None or selected == config.wifi_ssid:
+            return
+        if not valid_wifi_ssid(selected):
+            print("Wi-Fi 名称无效：需要 1～32 字节，不能包含控制字符。")
+            return
+        if selected != "iYanDa":
+            print("自定义 Wi-Fi 使用系统已有连接配置；请先在 Windows 中连接一次。")
+        save_network_preferences(replace(config, wifi_ssid=selected))
+
+    def configure_startup_network() -> None:
+        while True:
+            config = load_settings()
+            try:
+                registered = StartupManager().command()
+                current_command = startup_command()
+                startup_label = "关" if registered is None else (
+                    "开" if registered == current_command else "路径需更新（按 Enter 更新）"
+                )
+            except (OSError, ValueError):
+                registered = None
+                current_command = None
+                startup_label = "无法读取（权限或平台限制）"
+            choice = select_menu(
+                f"启动与网络设置：\n启动账号：{profile_label(config.last_selected_profile_id)}（跟随最近选择）",
+                [
+                    f"开机自启：{startup_label}（登录 Windows 后运行）",
+                    f"启动后自动监听：{'开' if config.auto_watch_on_start else '关'}",
+                    f"指定 Wi-Fi：{config.wifi_ssid}",
+                    "自动连接策略：" + ("保护其他 Wi-Fi/热点" if config.automatic_wifi_policy == "preserve" else "主动切换到指定 Wi-Fi"),
+                    f"启动监听时自动打开 Wi-Fi：{'开' if config.auto_enable_wifi else '关'}",
+                    "返回",
+                ],
+            )
+            try:
+                if choice == 0:
+                    manager = StartupManager()
+                    if registered is not None and registered == current_command:
+                        manager.disable()
+                        print("开机自启已关闭；启动后自动监听设置保留。")
+                    else:
+                        # Persist first, then register. Restore the preference if
+                        # Windows refuses the registry write.
+                        save_console_settings(replace(config, auto_watch_on_start=True))
+                        try:
+                            manager.enable()
+                        except (OSError, ValueError):
+                            save_console_settings(config)
+                            raise
+                        print("开机自启和启动自动监听已开启；下次登录 Windows 生效。")
+                        print("请保持程序所在路径固定；移动后在这里更新自启路径。")
+                elif choice == 1:
+                    enabled = not config.auto_watch_on_start
+                    save_console_settings(replace(config, auto_watch_on_start=enabled))
+                    print(f"启动自动监听已{'开启' if enabled else '关闭'}，下次打开程序生效。")
+                elif choice == 2:
+                    choose_wifi()
+                elif choice == 3:
+                    index = select_menu(
+                        "自动启动/定时任务/夜间恢复时的网络选择：",
+                        ["未连接时连接指定 Wi-Fi；其他 Wi-Fi/热点跳过", "主动切换到指定 Wi-Fi", "返回"],
+                    )
+                    if index in (0, 1):
+                        policy = "preserve" if index == 0 else "switch"
+                        if policy != config.automatic_wifi_policy:
+                            save_network_preferences(replace(config, automatic_wifi_policy=policy))
+                elif choice == 4:
+                    enabled = not config.auto_enable_wifi
+                    save_console_settings(replace(config, auto_enable_wifi=enabled))
+                    print(f"启动监听自动打开 Wi-Fi 已{'开启' if enabled else '关闭'}。")
+                    if enabled:
+                        print("开机链路需同时开启自启与自动监听；系统权限或硬件禁用时会提示失败。")
+                else:
+                    return
+            except (OSError, ValueError) as exc:
+                print(f"设置未完成：{sanitize_text(str(exc))}")
+
+    def manage_protection() -> None:
+        while True:
+            run_protection(build_parser().parse_args(["protection", "status"]))
+            choice = select_menu("认证保护（与账号切换、定时器、程序重启共享）：", ["刷新状态", "确认处理后手动解除", "返回"])
+            if choice == 0:
+                continue
+            if choice != 1:
+                return
+            print("请先确认旧会话已释放、冻结已解除或凭据已修正。解除后不会自动开始认证。")
+            if input("输入 RESET 确认（留空返回）：").strip() == "RESET" and stop_worker():
+                run_protection(build_parser().parse_args(["protection", "reset", "--confirm"]))
+
     def configure_menu() -> None:
         while True:
             config = load_settings()
@@ -1356,7 +1666,9 @@ def run_console(
                     "管理 10 个定时器",
                     f"夜间保护：{'开' if config.night_pause_enabled else '关'}（按 Enter 切换）",
                     "修改夜间保护恢复时间",
+                    "启动与网络设置（开机自启、自动监听、指定 Wi-Fi）",
                     "返回",
+                    "认证保护状态/手动解除",
                 ],
             )
             if choice == 0:
@@ -1369,6 +1681,10 @@ def run_console(
                 print(f"夜间保护已{'开启' if enabled else '关闭'}。")
             elif choice == 3:
                 configure_night_pause()
+            elif choice == 4:
+                configure_startup_network()
+            elif choice == 6:
+                manage_protection()
             else:
                 return
 
@@ -1379,9 +1695,27 @@ def run_console(
             name="ysu-timer-scheduler",
             daemon=True,
         )
-        scheduler_thread.start()
 
     try:
+        startup_settings = load_settings()
+        if startup_settings.auto_watch_on_start:
+            # Due timers have precedence. Avoid a second recovery cycle if a
+            # startup watcher fails before the scheduler's first tick.
+            if enable_scheduler and schedule.due_timers(
+                datetime.now(), startup_settings.timers, startup_settings.profiles,
+            ):
+                update_status("启动自动监听：优先执行已到期的定时器。")
+            else:
+                try:
+                    startup_profile = account_store.get(startup_settings.last_selected_profile_id or "")
+                except CredentialError as exc:
+                    update_status(f"启动自动监听已跳过：{exc}")
+                else:
+                    update_status(f"启动自动监听：{startup_profile.label}，目标 Wi-Fi {startup_settings.wifi_ssid}。")
+                    start_worker(startup_profile.mode, startup_profile.service,
+                                 profile_id=startup_profile.id, automatic_start=True)
+        if scheduler_thread is not None:
+            scheduler_thread.start()
         while True:
             reap_worker()
             defaults = load_settings()
@@ -1421,6 +1755,7 @@ def run_console(
                     f"\n监听目标：{active_line}"
                     + (f" · {profile_label(active_profile_id)}" if active_profile_id else "")
                     + f"\n夜间停网保护：{'开' if defaults.night_pause_enabled else '关'}"
+                    f"\n启动自动监听：{'开' if defaults.auto_watch_on_start else '关'} · Wi-Fi：{defaults.wifi_ssid}"
                     f"\n最近结果：{result_line}"
                     f"\n运行状态：{status_line}\n请选择操作："
                 )
@@ -1435,9 +1770,9 @@ def run_console(
             choice_index = select_menu(
                 menu_title,
                 [
-                    f"切换到 iYanDa 并监听校园网{campus_mark}",
+                    f"切换到 {defaults.wifi_ssid} 并监听校园网{campus_mark}",
                     (
-                        f"切换到 iYanDa 并监听默认宽带"
+                        f"切换到 {defaults.wifi_ssid} 并监听默认宽带"
                         f"（{SERVICE_NAMES[defaults.service]}）{broadband_mark}"
                     ),
                     "停止当前监听",
@@ -1458,7 +1793,9 @@ def run_console(
             elif choice == "4":
                 with worker_control_lock:
                     if stop_worker():
-                        run_logout(build_parser().parse_args(["logout"]), reporter=update_status)
+                        logout_args = build_parser().parse_args(["logout"])
+                        apply_console_wifi_options(logout_args, load_settings())
+                        run_logout(logout_args, reporter=update_status)
             elif choice == "5":
                 manage_accounts()
             elif choice == "6":
@@ -1513,6 +1850,10 @@ def run_account_verify(args: argparse.Namespace, reporter=print) -> int:
         reporter(f"账号试验已跳过：{reason}；{exit_code_text(EXIT_PLANNED_PAUSE)}")
         return EXIT_PLANNED_PAUSE
 
+    protection = AuthProtection()
+    if code := authentication_precheck(protection, reporter):
+        return code
+
     wifi_result = connect_wifi(args, reporter=reporter)
     if wifi_result:
         return wifi_result
@@ -1520,6 +1861,7 @@ def run_account_verify(args: argparse.Namespace, reporter=print) -> int:
     connector = WifiConnector(args.wifi_ssid, create_open_profile=False)
     portal = PortalClient(
         reporter=reporter,
+        protection=protection,
         operation_allowed=lambda: (
             not current_pause_reason()
             and (connector.current_ssid() or "").casefold() == args.wifi_ssid.casefold()
@@ -1537,6 +1879,8 @@ def run_account_verify(args: argparse.Namespace, reporter=print) -> int:
             )
             return EXIT_VERIFY_SKIPPED
 
+        if code := authentication_precheck(protection, reporter):
+            return code
         credential = selected_credential_source(args, mode, profile).get()
         submitted = portal.login(
             credential.username,
@@ -1557,11 +1901,17 @@ def run_account_verify(args: argparse.Namespace, reporter=print) -> int:
         reporter(f"账号试验缺少凭据：{exc}；{exit_code_text(10)}")
         return 10
     except PortalError as exc:
+        if not persist_terminal_restriction(protection, exc, reporter):
+            return EXIT_AUTH_PROTECTED
         if reason := current_pause_reason():
             reporter(f"账号试验已停止：{reason}；{exit_code_text(EXIT_PLANNED_PAUSE)}")
             return EXIT_PLANNED_PAUSE
         secrets = (credential.username, credential.password) if "credential" in locals() else ()
-        if exc.category in {"timeout", "network_error", "operation_cancelled"}:
+        if exc.category == "authentication_cooldown":
+            code = EXIT_AUTH_COOLDOWN
+        elif exc.category in {"mac_conflict", "mac_blocked", "rate_limited", "authentication_protected", "protection_invalid"}:
+            code = EXIT_AUTH_PROTECTED
+        elif exc.category in {"timeout", "network_error", "operation_cancelled"}:
             code = EXIT_NETWORK_UNCONFIRMED
         elif exc.category == "ip_blocked":
             code = EXIT_IP_BLOCKED
@@ -1645,7 +1995,7 @@ def main(argv: list[str] | None = None) -> int:
                     try_next_account=getattr(args, "try_next_account", False),
                 )
             handlers = {"watch": run_watch, "login": run_login, "logout": run_logout,
-                        "credential": run_credential, "account": run_account}
+                        "credential": run_credential, "account": run_account, "protection": run_protection}
             if command == "status":
                 return run_status()
             return handlers[command](args) if command in handlers else 2
@@ -1657,7 +2007,8 @@ def main(argv: list[str] | None = None) -> int:
             return 10
 
     readonly_account = command == "account" and args.account_command == "list"
-    if command in {"watch", "console", "login", "logout", "credential", "account"} and not readonly_account:
+    readonly_protection = command == "protection" and args.protection_command == "status"
+    if command in {"watch", "console", "login", "logout", "credential", "account", "protection"} and not readonly_account and not readonly_protection:
         try:
             with SingleInstanceLock():
                 return dispatch()

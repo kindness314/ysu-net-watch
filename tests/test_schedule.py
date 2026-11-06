@@ -105,6 +105,17 @@ class TimerScheduleTests(unittest.TestCase):
 
         self.assertEqual(schedule.due_timers(eight, timers), [])
 
+    def test_device_protection_suppresses_compensation_but_temporary_cooldown_does_not(self) -> None:
+        for code in (27, 28):
+            with self.subTest(code=code):
+                six = datetime(2026, 7, 30, 6, 0)
+                eight = datetime(2026, 7, 30, 8, 0)
+                schedule = TimerSchedule()
+                timers = (self.timer(),)
+                run = schedule.mark_started(schedule.due_timers(six, timers)[0], six.date())
+                schedule.mark_finished(run, code)
+                self.assertEqual(bool(schedule.due_timers(eight, timers)), code == 28)
+
     def test_protocol_change_does_not_trigger_compensation(self) -> None:
         six = datetime(2026, 7, 30, 6, 0)
         eight = datetime(2026, 7, 30, 8, 0)
@@ -258,6 +269,119 @@ class TimerScheduleTests(unittest.TestCase):
                     datetime(2026, 7, 30, 6),
                     (self.timer(),),
                 )
+
+    def test_new_primary_clears_previous_day_markers_before_restart(self) -> None:
+        for previous_retry in (False, True):
+            for finish_code in (None, 0, 20, 23):
+                with self.subTest(previous_retry=previous_retry, finish_code=finish_code):
+                    with tempfile.TemporaryDirectory() as directory:
+                        path = Path(directory) / "schedule-state.json"
+                        timers = (self.timer(),)
+                        schedule = TimerSchedule(state_path=path)
+                        old_day = datetime(2026, 9, 25, 6)
+                        old_run = schedule.mark_started(
+                            schedule.due_timers(old_day, timers)[0], old_day.date(),
+                        )
+                        schedule.mark_finished(old_run, 20)
+                        if previous_retry:
+                            eight = old_day.replace(hour=8)
+                            schedule.mark_started(
+                                schedule.due_timers(eight, timers)[0], eight.date(),
+                            )
+                        new_day = datetime(2026, 10, 2, 6)
+                        new_run = schedule.mark_started(
+                            schedule.due_timers(new_day, timers)[0], new_day.date(),
+                        )
+                        # A late result from the old worker must not restore it.
+                        schedule.mark_finished(old_run, 20)
+                        if finish_code is not None:
+                            schedule.mark_finished(new_run, finish_code)
+                        restarted = TimerSchedule(state_path=path)
+                        self.assertEqual(restarted.due_timers(new_day, timers), [])
+                        self.assertEqual(restarted.primary_started[0], new_day.date())
+                        self.assertNotIn(0, restarted.retry_started)
+                        due = restarted.due_timers(new_day.replace(hour=8), timers)
+                        self.assertEqual([item.phase for item in due],
+                                         ["retry"] if finish_code == 20 else [])
+
+    def test_legacy_stale_markers_are_backed_up_without_repeating_primary(self) -> None:
+        for stale_key in ("primary_failed", "retry_started", "both"):
+            with self.subTest(stale_key=stale_key):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "schedule-state.json"
+                    timers = (self.timer(),)
+                    TimerSchedule(state_path=path).sync(timers)
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    record = payload["timers"]["0"]
+                    record["primary_started"] = "2026-10-02"
+                    for key in ("primary_failed", "retry_started"):
+                        record[key] = "2026-09-25" if stale_key in (key, "both") else None
+                    original = json.dumps(payload)
+                    path.write_text(original, encoding="utf-8")
+                    restarted = TimerSchedule(state_path=path)
+                    self.assertEqual(restarted.due_timers(datetime(2026, 10, 2, 8), timers), [])
+                    backups = list(path.parent.glob("schedule-state.json.pre-date-cleanup.*.bak"))
+                    self.assertEqual(len(backups), 1)
+                    self.assertEqual(backups[0].read_text(encoding="utf-8"), original)
+                    migrated = json.loads(path.read_text(encoding="utf-8"))["timers"]["0"]
+                    self.assertEqual(migrated["primary_started"], "2026-10-02")
+                    self.assertIsNone(migrated["primary_failed"])
+                    self.assertIsNone(migrated["retry_started"])
+                    self.assertEqual(TimerSchedule(state_path=path).due_timers(
+                        datetime(2026, 10, 2, 8), timers), [])
+                    self.assertEqual(len(list(path.parent.glob("*.bak"))), 1)
+
+    def test_migration_retains_current_day_failure_and_retry_eligibility(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "schedule-state.json"
+            timers = (self.timer(),)
+            TimerSchedule(state_path=path).sync(timers)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["timers"]["0"].update(
+                primary_started="2026-10-02", primary_failed="2026-10-02",
+                retry_started="2026-09-25",
+            )
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            schedule = TimerSchedule(state_path=path)
+            eight = datetime(2026, 10, 2, 8)
+            due = schedule.due_timers(eight, timers)
+            self.assertEqual([item.phase for item in due], ["retry"])
+            schedule.mark_started(due[0], eight.date())
+            self.assertEqual(TimerSchedule(state_path=path).due_timers(eight, timers), [])
+
+    def test_previous_day_retry_token_cannot_overwrite_new_day_state(self) -> None:
+        schedule = TimerSchedule()
+        timers = (self.timer(),)
+        old_day = datetime(2026, 9, 25, 6)
+        old_run = schedule.mark_started(schedule.due_timers(old_day, timers)[0], old_day.date())
+        schedule.mark_finished(old_run, 20)
+        old_retry = schedule.due_timers(old_day.replace(hour=8), timers)[0]
+        new_day = datetime(2026, 10, 2, 6)
+        schedule.mark_started(schedule.due_timers(new_day, timers)[0], new_day.date())
+        self.assertIsNone(schedule.mark_started(old_retry, old_day.date()))
+        self.assertNotIn(0, schedule.retry_started)
+
+    def test_future_secondary_date_blocks_migration_without_partial_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "schedule-state.json"
+            timers = (self.timer(), self.timer())
+            TimerSchedule(state_path=path).sync(timers)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["timers"]["0"].update(
+                primary_started="2026-10-02", primary_failed="2026-09-25",
+            )
+            payload["timers"]["1"].update(
+                primary_started="2026-10-02", retry_started="2026-10-03",
+            )
+            original = json.dumps(payload)
+            path.write_text(original, encoding="utf-8")
+            schedule = TimerSchedule(state_path=path)
+            with self.assertRaisesRegex(ValueError, "日期关系无效"):
+                schedule.sync(timers)
+            self.assertEqual(schedule.primary_started, {})
+            self.assertEqual(schedule.primary_failed, {})
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+            self.assertEqual(list(path.parent.glob("*.bak")), [])
 
     def test_inconsistent_failure_state_cannot_trigger_retry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

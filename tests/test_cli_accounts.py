@@ -36,6 +36,7 @@ class AccountCliTests(unittest.TestCase):
         self.path = Path(directory.name) / "settings.json"
         for patcher in (
             patch("ysu_net_watch.settings.default_settings_path", return_value=self.path),
+            patch("ysu_net_watch.protection.default_protection_path", return_value=self.path.with_name("protection.json")),
             patch("ysu_net_watch.cli.current_pause_reason", return_value=None),
         ):
             patcher.start()
@@ -171,7 +172,7 @@ class AccountCliTests(unittest.TestCase):
             self.assertEqual(run_account_verify(args), 24)
 
     def test_night_protection_is_a_visible_direct_toggle_enabled_by_default(self):
-        choices = iter([5, 2, 4, 6])
+        choices = iter([5, 2, 5, 6])
         menus = []
 
         def menu(title, options, **_kwargs):
@@ -186,7 +187,7 @@ class AccountCliTests(unittest.TestCase):
 
     def test_night_protection_can_be_enabled_again_from_the_same_toggle(self):
         save_settings(replace(AppSettings(), night_pause_enabled=False), self.path)
-        choices = iter([5, 2, 4, 6])
+        choices = iter([5, 2, 5, 6])
         menus = []
 
         def menu(title, options, **_kwargs):
@@ -348,7 +349,7 @@ class AccountCliTests(unittest.TestCase):
     def test_menu_add_default_and_timer_binding_preserve_secret_privacy(self):
         # Main -> settings -> accounts -> add -> telecom -> new profile/default
         # -> timers -> timer 2 / bind new profile / enable -> exit.
-        choices = [4, 4, 2, 4, 1, 6, 6, 5, 1, 1, 3, 4, 0, 6, 10, 4, 6]
+        choices = [4, 4, 2, 4, 1, 6, 6, 5, 1, 1, 3, 4, 0, 6, 10, 5, 6]
         output = io.StringIO()
         with (
             redirect_stdout(output),

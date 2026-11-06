@@ -45,3 +45,11 @@ def windows_system_executable(filename: str) -> str:
     if not executable.is_file():
         raise FileNotFoundError(f"trusted Windows executable was not found: {executable}")
     return str(executable)
+
+
+def windows_powershell_executable() -> str:
+    system_dir = Path(windows_system_executable("netsh.exe")).parent
+    executable = system_dir / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    if not executable.is_file():
+        raise FileNotFoundError("trusted Windows PowerShell was not found")
+    return str(executable)

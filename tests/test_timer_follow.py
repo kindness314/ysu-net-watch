@@ -165,7 +165,7 @@ class TimerFollowTests(unittest.TestCase):
         self.assertFalse(self.path.exists())
 
     def test_configure_common_account_also_updates_first_timer(self):
-        with patch("ysu_net_watch.cli.select_menu", side_effect=[5, 0, 1, 1, 4, 6]):
+        with patch("ysu_net_watch.cli.select_menu", side_effect=[5, 0, 1, 1, 5, 6]):
             self.assertEqual(run_console(enable_scheduler=False), 0)
         current = load_settings(self.path)
         self.assertEqual(current.service, "telecom")
@@ -174,7 +174,7 @@ class TimerFollowTests(unittest.TestCase):
     def test_menu_cancel_and_custom_timer_binding_do_not_replace_selection(self):
         self.store.remember_selection(self.telecom)
         # Bind timer 2 to campus, then cancel timer 1's account picker.
-        choices = [5, 1, 1, 3, 0, 6, 0, 3, 4, 6, 10, 4, 6]
+        choices = [5, 1, 1, 3, 0, 6, 0, 3, 4, 6, 10, 5, 6]
         with patch("ysu_net_watch.cli.select_menu", side_effect=choices):
             self.assertEqual(run_console(enable_scheduler=False), 0)
         current = load_settings(self.path)
@@ -183,7 +183,7 @@ class TimerFollowTests(unittest.TestCase):
         self.assertEqual(current.timers[1].profile_id, self.campus)
 
     def test_first_timer_account_picker_updates_selection_and_reset_keeps_it(self):
-        choices = [5, 1, 0, 3, 2, 5, 6, 10, 4, 6]
+        choices = [5, 1, 0, 3, 2, 5, 6, 10, 5, 6]
         with patch("ysu_net_watch.cli.select_menu", side_effect=choices):
             self.assertEqual(run_console(enable_scheduler=False), 0)
         current = load_settings(self.path)
@@ -238,6 +238,7 @@ class TimerFollowTests(unittest.TestCase):
             stop.wait(2)
         def watch(args, **kwargs):
             self.assertEqual(args.profile, self.campus)
+            self.assertTrue(args.automatic_start)
             self.assertFalse(kwargs["remember_selection"])
             started.set()
             kwargs["external_stop_event"].wait(2)

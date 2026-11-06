@@ -19,7 +19,7 @@ SCHEDULE_STATE_SCHEMA = 1
 # protocol later in the day is unsafe.  The numeric values mirror the public
 # watcher exit codes while keeping this small scheduling module independent of
 # the monitor implementation.
-NON_RETRYABLE_EXIT_CODES = frozenset({23, 24, 26, 30})
+NON_RETRYABLE_EXIT_CODES = frozenset({23, 24, 26, 27, 30})
 
 
 def default_schedule_state_path() -> Path:
@@ -61,12 +61,12 @@ def _stored_date(value: object, field_name: str) -> date | None:
 
 
 def night_pause_until(now: datetime, settings: AppSettings) -> datetime | None:
-    """Mon–Thu 23:30 until the following day's timer 1 time, even if disabled."""
+    """Sun–Thu 23:30 until the following day's timer 1 time, even if disabled."""
     if not settings.night_pause_enabled:
         return None
     hour, minute = map(int, settings.timers[0].time.split(":"))
     for origin in (now.date(), now.date() - timedelta(days=1)):
-        if origin.weekday() not in (0, 1, 2, 3):
+        if origin.weekday() not in (6, 0, 1, 2, 3):
             continue
         start = datetime.combine(origin, time(23, 30), tzinfo=now.tzinfo)
         end = datetime.combine(origin + timedelta(days=1), time(hour, minute), tzinfo=now.tzinfo)
@@ -118,7 +118,8 @@ class TimerSchedule:
         if self.state_path is None:
             return
         try:
-            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+            original_state = self.state_path.read_text(encoding="utf-8")
+            payload = json.loads(original_state)
         except FileNotFoundError:
             self._state_dirty = True
             return
@@ -140,6 +141,10 @@ class TimerSchedule:
             raise ValueError("定时状态中的任务记录过多")
 
         seen: set[int] = set()
+        loaded_dates: dict[int, dict[str, date | None]] = {}
+        changed_bindings: set[int] = set()
+        dirty = False
+        migrated = False
         for raw_index, raw in payload["timers"].items():
             if (
                 not isinstance(raw_index, str)
@@ -154,7 +159,7 @@ class TimerSchedule:
                 raise ValueError("定时状态中存在重复任务记录")
             seen.add(index)
             if index not in self._fingerprints:
-                self._state_dirty = True
+                dirty = True
                 continue
             fingerprint = raw.get("fingerprint")
             pending_change = raw.get("pending_change", False)
@@ -166,11 +171,11 @@ class TimerSchedule:
                 raise ValueError("定时状态中的任务指纹无效")
             if fingerprint != self._fingerprints[index]:
                 if self._bindings[index][0].enabled:
-                    self._changed_bindings.add(index)
-                self._state_dirty = True
+                    changed_bindings.add(index)
+                dirty = True
                 continue
             if pending_change and self._bindings[index][0].enabled:
-                self._changed_bindings.add(index)
+                changed_bindings.add(index)
             stored_dates = {
                 key: _stored_date(raw.get(key), key)
                 for key in (
@@ -180,14 +185,31 @@ class TimerSchedule:
                 )
             }
             primary = stored_dates["primary_started"]
-            if (
-                stored_dates["primary_failed"] is not None
-                and stored_dates["primary_failed"] != primary
-            ) or (
-                stored_dates["retry_started"] is not None
-                and stored_dates["retry_started"] != primary
-            ):
-                raise ValueError("定时状态中的任务日期关系无效")
+            for key in ("primary_failed", "retry_started"):
+                stored = stored_dates[key]
+                if stored is None or stored == primary:
+                    continue
+                if primary is None or stored > primary:
+                    raise ValueError("定时状态中的任务日期关系无效")
+                # rc1 could persist a previous day's failure/compensation after
+                # starting a new primary. Retain the primary once-only marker.
+                stored_dates[key] = None
+                migrated = True
+            loaded_dates[index] = stored_dates
+
+        if migrated:
+            backup = self.state_path.with_name(
+                f"{self.state_path.name}.pre-date-cleanup.{uuid.uuid4().hex}.bak"
+            )
+            with backup.open("x", encoding="utf-8") as stream:
+                stream.write(original_state)
+
+        # Commit only after all records validate and any migration is backed up.
+        self._changed_bindings.update(changed_bindings)
+        self.primary_started.clear()
+        self.primary_failed.clear()
+        self.retry_started.clear()
+        for index, stored_dates in loaded_dates.items():
             for key, target in (
                 ("primary_started", self.primary_started),
                 ("primary_failed", self.primary_failed),
@@ -196,7 +218,7 @@ class TimerSchedule:
                 if stored_dates[key] is not None:
                     target[index] = stored_dates[key]
 
-        if seen != set(self._fingerprints):
+        if dirty or migrated or seen != set(self._fingerprints):
             self._state_dirty = True
 
     def _save_state(self) -> None:
@@ -299,6 +321,7 @@ class TimerSchedule:
                         # Editing/rebinding an elapsed timer is not a request to
                         # run it immediately. Catch-up is for startup/resume.
                         self.primary_started[index] = today
+                        self.primary_failed.pop(index, None)
                         self.retry_started[index] = today
                         self._state_dirty = True
                         self._save_state()
@@ -339,6 +362,12 @@ class TimerSchedule:
                 return None
             records = self.primary_started if due.phase == "primary" else self.retry_started
             if records.get(due.index) == today:
+                return None
+            if due.phase == "primary":
+                self.primary_failed.pop(due.index, None)
+                self.retry_started.pop(due.index, None)
+            elif (self.primary_started.get(due.index) != today
+                  or self.primary_failed.get(due.index) != today):
                 return None
             records[due.index] = today
             if due.phase == "primary" and due.retry_window_missed:

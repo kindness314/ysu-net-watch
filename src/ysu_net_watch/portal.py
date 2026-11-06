@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .recovery import RecoveryState
+from .protection import AuthProtection, ProtectionError, TERMINAL_REASONS
 
 import base64
 import re
@@ -47,6 +48,8 @@ class PortalClient:
         reporter=print,
         operation_allowed=None,
         verification_delays: tuple[float, ...] = (2.0, 3.0, 5.0, 5.0),
+        protection: AuthProtection | None = None,
+        confirm_success: bool = True,
     ):
         self.timeout = timeout
         self.sleeper = sleeper
@@ -54,6 +57,8 @@ class PortalClient:
         self.operation_allowed = operation_allowed or (lambda: True)
         self.verification_delays = verification_delays
         self.recovery = RecoveryState()
+        self.protection = protection
+        self.confirm_success = confirm_success
         self.session = self._new_http_session()
 
     @staticmethod
@@ -95,6 +100,8 @@ class PortalClient:
             raise PortalError("timeout", stage, f"{stage} timed out") from exc
         except requests.RequestException as exc:
             status = exc.response.status_code if exc.response is not None else None
+            if status == 429:
+                raise PortalError("rate_limited", stage, "门户返回 HTTP 429：认证请求过于频繁，已停止提交", status) from exc
             raise PortalError("network_error", stage, f"{stage} request failed", status) from exc
 
     def _request_follow_safe(
@@ -762,6 +769,26 @@ class PortalClient:
         transient would repeatedly submit the same credentials.  Keep this
         classifier narrow and let the caller choose the fallback category.
         """
+        normalized = cls._normalized_auth_message(message)
+        if "maccollision" in normalized or "mac冲突" in normalized or "mac地址冲突" in normalized:
+            return "mac_conflict"
+        # Bind the restriction to its subject. A frozen ACCOUNT response can
+        # also append an unrelated terminal MAC; that is not a MAC freeze.
+        if re.search(
+            r"(?:mac(?:address|地址)?|物理地址|设备|终端|device)"
+            r"(?:[:：（(]?(?:[0-9a-f]{12}|(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2})[）)]?)?"
+            r"(?:已经|已被|已经被|被|已|处于|列入|加入|is|was|hasbeen|[:：=_-])*"
+            r"(?:冻结|封禁|锁定|黑名单|禁止认证|禁止登录|不允许认证|受限|限制认证|"
+            r"frozen|blocked|banned|blacklisted|locked|restricted|denied)",
+            normalized,
+        ) or re.search(r"(?:blocked|frozen|blacklisted|banned)(?:mac(?:address)?|device)", normalized):
+            return "mac_blocked"
+        if any(word in normalized for word in (
+            "认证过于频繁", "认证太频繁", "登录过于频繁", "操作过于频繁",
+            "请求过于频繁", "认证频率过高", "toomanyauthenticationattempts", "toomanyloginattempts",
+            "toomanyrequests", "ratelimitexceeded", "authenticationtoofrequent",
+        )):
+            return "rate_limited"
         # IP freezes must be checked before account freezes: both may contain
         # words such as “冻结/锁定”, but they require different remediation.
         if cls._ip_blocked(message):
@@ -847,6 +874,33 @@ class PortalClient:
         allow_workflow_retry: bool = True,
     ) -> bool:
         """Return whether this call submitted a login, not just reused a session."""
+        try:
+            if self.protection is not None:
+                self.protection.check()
+            submitted = self._protected_login(
+                username, password, service, force_switch=force_switch,
+                recovery=recovery, allow_device_release=allow_device_release,
+                allow_workflow_retry=allow_workflow_retry,
+            )
+            if submitted and self.protection is not None and self.confirm_success:
+                self.protection.succeeded()
+            return submitted
+        except ProtectionError as exc:
+            raise PortalError(exc.category, "authentication_protection", str(exc)) from exc
+        except PortalError as exc:
+            if self.protection is not None and exc.category not in {
+                "authentication_protected", "authentication_cooldown", "protection_invalid",
+            }:
+                try:
+                    self.protection.failed(exc.category)
+                except ProtectionError as state_error:
+                    raise PortalError(state_error.category, "authentication_protection", str(state_error)) from state_error
+            raise
+
+    def _protected_login(
+        self, username: str, password: str, service: str, *, force_switch: bool,
+        recovery: RecoveryState | None, allow_device_release: bool, allow_workflow_retry: bool,
+    ) -> bool:
         self.recovery = recovery if recovery is not None else RecoveryState()
         self._require_active("status")
         status = self.status()
@@ -873,6 +927,10 @@ class PortalClient:
                         str(exc),
                         exc.http_status,
                     ) from exc
+                if self.protection is not None:
+                    # The watcher retries with a fresh client after its long
+                    # delay. Do not hide another CAS submission in this call.
+                    raise
                 if not self.recovery.claim_workflow_session_retry():
                     raise PortalError(
                         "protocol_changed",
@@ -892,8 +950,15 @@ class PortalClient:
         *,
         allow_device_release: bool = True,
     ) -> bool:
+        self._require_active("portal_redirect")
+        if self.protection is not None:
+            self.protection.check()
         session_info = self.redirect_to_portal()
         session_id = session_info["sessionId"]
+        self._require_active("cas_login")
+        if self.protection is not None:
+            reserved = self.protection.reserve()
+            self.reporter(f"本轮认证预占共享提交预算：{reserved}/4；重启或切换账号不清零。")
         self.cas_login(username, password, session_info)
         self.service_selection(session_id)
 
@@ -922,6 +987,7 @@ class PortalClient:
 
         if service_error is not None and service_error.category in {
             "ip_blocked", "account_locked", "credential_rejected",
+            "mac_conflict", "mac_blocked", "rate_limited",
             "account_device_limit",
         }:
             raise service_error
@@ -961,6 +1027,9 @@ class PortalClient:
             last_online_message = str(
                 online.get("message") or "portal reports that the user is offline"
             )
+            restriction = self._auth_message_category(last_online_message, default="verification_failed")
+            if restriction in TERMINAL_REASONS:
+                raise PortalError(restriction, "verify_login", last_online_message)
             if self._account_device_limit(last_online_message):
                 raise PortalError(
                     "account_device_limit", "verify_login", last_online_message,
@@ -1006,6 +1075,9 @@ class PortalClient:
                     or "portal reports that the user is offline"
                 )
 
+        restriction = self._auth_message_category(last_online_message, default="verification_failed")
+        if restriction in TERMINAL_REASONS:
+            raise PortalError(restriction, "verify_login", last_online_message)
         if service_error is not None:
             if service_error.category == "workflow_session_invalid":
                 raise service_error

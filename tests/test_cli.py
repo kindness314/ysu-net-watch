@@ -51,6 +51,10 @@ class CliParserTests(unittest.TestCase):
                               return_value=Path(directory.name) / "settings.json")
         settings_path.start()
         self.addCleanup(settings_path.stop)
+        protection_path = patch("ysu_net_watch.protection.default_protection_path",
+                                return_value=Path(directory.name) / "protection.json")
+        protection_path.start()
+        self.addCleanup(protection_path.stop)
         pause = patch("ysu_net_watch.cli.current_pause_reason", return_value=None)
         pause.start()
         self.addCleanup(pause.stop)
@@ -226,7 +230,7 @@ class CliParserTests(unittest.TestCase):
         with (
             patch(
                 "builtins.input",
-                side_effect=["6", "1", "2", "2", "5", "7"],
+                side_effect=["6", "1", "2", "2", "6", "7"],
             ),
             patch(
                 "ysu_net_watch.cli.load_settings",
@@ -278,7 +282,7 @@ class CliParserTests(unittest.TestCase):
         with (
             patch(
                 "builtins.input",
-                side_effect=["6", "2", "2", "1", "2", "7", "11", "5", "7"],
+                side_effect=["6", "2", "2", "1", "2", "7", "11", "6", "7"],
             ),
             patch("ysu_net_watch.cli.load_settings", return_value=initial),
             patch("ysu_net_watch.cli.save_settings") as save,
@@ -295,7 +299,7 @@ class CliParserTests(unittest.TestCase):
         with (
             patch(
                 "builtins.input",
-                side_effect=["6", "2", "2", "2", "", "7", "11", "5", "7"],
+                side_effect=["6", "2", "2", "2", "", "7", "11", "6", "7"],
             ),
             patch("ysu_net_watch.cli.load_settings", return_value=initial),
             patch("ysu_net_watch.cli.save_settings") as save,
