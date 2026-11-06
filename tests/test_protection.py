@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -232,6 +233,23 @@ class ProtectionTests(unittest.TestCase):
             self.assertEqual(self.guard.status()["blocked"], "mac_conflict")
             self.assertEqual(run_protection(build_parser().parse_args(["protection", "reset", "--confirm"])), 0)
             self.assertIsNone(self.guard.status()["blocked"])
+
+    def test_mac_restriction_prefixes_remain_supported_without_repetition(self):
+        for message in (
+            "设备已经被冻结", "MAC地址:已被:封禁", "MAC已被列入黑名单",
+            "MAC已经被列入黑名单", "device has been blocked", "MAC was locked",
+        ):
+            with self.subTest(message=message):
+                self.assertEqual(PortalClient._auth_message_category(message, default="api_error"), "mac_blocked")
+
+    def test_repeated_untrusted_mac_prefix_does_not_backtrack_exponentially(self):
+        # CodeQL's counterexample used overlapping repeated "已被" prefixes.
+        # This is synthetic response text, not an authentication request.
+        start = time.monotonic()
+        for prefix in ("已被", "已经被", ":", "hasbeen"):
+            message = "设备" + prefix * 20000 + "暂不可用"
+            self.assertEqual(PortalClient._auth_message_category(message, default="api_error"), "api_error")
+        self.assertLess(time.monotonic() - start, 2.0)
 
     def test_cli_manual_login_stops_before_wifi_and_credentials_when_blocked(self):
         self.guard.failed("mac_conflict")

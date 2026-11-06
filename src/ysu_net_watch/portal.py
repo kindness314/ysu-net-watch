@@ -777,7 +777,9 @@ class PortalClient:
         if re.search(
             r"(?:mac(?:address|地址)?|物理地址|设备|终端|device)"
             r"(?:[:：（(]?(?:[0-9a-f]{12}|(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2})[）)]?)?"
-            r"(?:已经|已被|已经被|被|已|处于|列入|加入|is|was|hasbeen|[:：=_-])*"
+            # No repeated, overlapping alternatives: e.g. many "已被" tokens
+            # from an untrusted response must not cause exponential backtracking.
+            r"[:：=_-]?(?:已经被列入|已被列入|被列入|已经被|已经|已被|被|已|处于|列入|加入|is|was|hasbeen)?[:：=_-]?"
             r"(?:冻结|封禁|锁定|黑名单|禁止认证|禁止登录|不允许认证|受限|限制认证|"
             r"frozen|blocked|banned|blacklisted|locked|restricted|denied)",
             normalized,
