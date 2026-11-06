@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ysu-net-watch"
-version = "0.3.0rc7"
+version = "0.3.0rc8"
 description = "YSU iYanda captive portal watcher and automatic authenticator"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,8 +25,10 @@ classifiers = [
 ]
 dependencies = [
   "beautifulsoup4>=4.12,<5",
+    "certifi>=2026.10.23",
   "pycryptodome>=3.20,<4",
   "requests>=2.32,<3",
+    "urllib3>=2.8.0,<3",
 ]
 
 [project.scripts]
