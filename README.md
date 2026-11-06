@@ -455,7 +455,7 @@ python -m pip install pyinstaller
 | `30` | 认证门户协议发生变化 |
 | `40` | 无法配置或连接指定 Wi-Fi |
 
-### 防止反复认证（0.3.0rc5）
+### 防止反复认证（rc8 已包含，自 rc5 引入）
 
 最多四次新的认证流程，前三次失败后分别等待 5、15、30 分钟。这是保守的客户端策略，
 不是校园网公布的安全阈值，不能保证绝不触发运营商风控。`mac collision` 不等同于已冻结，
@@ -470,9 +470,9 @@ python -m pip install pyinstaller
 或在退出正在运行的程序后执行：
 
 ```powershell
-.\ysu-net-watch-v0.3.0-rc.5-windows-x64.exe protection status
+.\ysu-net-watch.exe protection status
 # 仅在确认旧会话已释放、冻结已解除或凭据已修正后：
-.\ysu-net-watch-v0.3.0-rc.5-windows-x64.exe protection reset --confirm
+.\ysu-net-watch.exe protection reset --confirm
 ```
 
 解除保护不会立即认证，且至少保留上次新认证流程后的五分钟间隔。保护文件损坏、
